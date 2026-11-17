@@ -21,6 +21,12 @@ on:
       kicad_run:
         description: "kicad-pane job: a Backplane_KiCad macOS CI run whose package (backplane-kicad-macos-native) has the macOS embedding"
         default: ""
+      pane_mode:
+        description: "kicad-pane job: MAC_MODE for mac_pane_e2e.py (empty: the whole run; front: KiCad's frame front-most over the pane, with the 60 Hz window-order trace in the artifact)"
+        default: ""
+      pane_env:
+        description: "kicad-pane job: extra environment for the run, space separated NAME=value (e.g. BACKPLANE_KICAD_MAC_WATCH=off FRONT_REPS=3)"
+        default: ""
       kicad_via:
         description: "kicad-runtime job: curl (fetch and check the tag's package by hand) or driver (Settings > CAD > Install: the hub's own install driver, which needs the hub's MAC pin on that tag)"
         default: "curl"
@@ -90,6 +96,8 @@ jobs:
         run: |
           set -o pipefail; mkdir -p out
           python -m pip install --quiet pyobjc-framework-Quartz pyobjc-framework-Cocoa
+          for kv in ${{ inputs.pane_env }}; do export "$kv"; done
+          export MAC_MODE="${{ inputs.pane_mode }}" ZTRACE=1; [ -n "$MAC_MODE" ] || unset MAC_MODE ZTRACE
           python test/kicad_embed/mac_pane_e2e.py "$PWD/native/gpui/target/release/backplane-gpui" "$PWD/native/host/target/release/backplane-hub" "$PWD/assets" "$RT" "$PWD/out/pane" 2>&1 | tee out/pane.txt
       - uses: actions/upload-artifact@v4
         if: always()

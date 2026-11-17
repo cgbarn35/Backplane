@@ -214,6 +214,22 @@ pub fn raise_step(above: bool, on_screen: bool, st: &mut RaiseState, buried: &mu
     if now.duration_since(since) >= KICAD_RAISE_BOUND { *buried = true; }
     RaiseStep::Retry(st.tries)
 }
+/// macOS: whose a normal on-screen window is, for the order rule: this pane's own window is `Ours`, the frame on show `Frame`, KiCad's
+/// other windows (its dialogs) `Kicad`, our app's other windows `OurOther`, anyone else's `Other`.
+#[derive(Debug, Clone, Copy, PartialEq)] pub enum Who { Ours, Frame, Kicad, OurOther, Other }
+/// macOS: what may be done about the order, from the window server's list front to back (pure, for the tests). THE RULE: the client
+/// orders one window only, its own, and only past its own and its KiCad's windows. It never orders, raises or lowers a window that is
+/// not its own, and never moves its own window over or under another app's: with another app's window between ours and the frame (in
+/// either direction) the only one who may act is KiCad, on its own frame (`AskKicad`: it puts the frame just above ours).
+/// `Above`: the frame is above ours with nothing but KiCad's own windows between. `Idle`: the frame or our window is not on screen.
+/// `OursBelow`: the frame is behind ours with only our own and KiCad's windows between: ours goes just below the frame.
+#[derive(Debug, PartialEq)] pub enum OrderPlan { Above, Idle, OursBelow, AskKicad }
+pub fn order_plan(stack: &[Who]) -> OrderPlan {
+    let (Some(u), Some(f)) = (stack.iter().position(|w| *w == Who::Ours), stack.iter().position(|w| *w == Who::Frame)) else { return OrderPlan::Idle };
+    let between = &stack[u.min(f) + 1..u.max(f)];
+    if between.iter().any(|w| *w == Who::Other) { return OrderPlan::AskKicad }
+    if f < u { if between.iter().all(|w| *w == Who::Kicad) { OrderPlan::Above } else { OrderPlan::AskKicad } } else { OrderPlan::OursBelow }
+}
 /// macOS: whether a re-order of ours also asks KiCad to order its frame above our window (`raise` in editor.kicad.host). KiCad's own
 /// order only counts while KiCad is the active app: an inactive app's window is not let in front of the active app's key window, and a
 /// frame ordered "above" ours then lands behind it, after our own order had already put it right. So: while KiCad is active, both (as
@@ -319,7 +335,7 @@ pub struct KicadPane {
     mac_raise: RaiseState, mac_buried: bool, mac_watching: bool,
     /// macOS: until when the watch looks every frame's time (a push, a re-order, an activation or a press of ours just happened), and
     /// what was last seen, to tell a change (our window key, the frame on show)
-    mac_hot: Option<std::time::Instant>, mac_seen: (bool, Option<u64>),
+    mac_hot: Option<std::time::Instant>, mac_seen: (bool, Option<u64>), mac_pressed: bool, mac_looked: Option<std::time::Instant>,
     /// the .kicad_pro the hub resolved this pane's project to (its attach reply), "" until then
     pub bound: String,
     pub project: String, pub root: String, pub project_id: String, pub open: String, last_hub_open: String, hub: tokio::sync::mpsc::Sender<Command>,
@@ -457,7 +473,7 @@ impl KicadPane {
             last = std::time::Instant::now();
             let _ = drained_tx.send(());
         } }).detach();
-        KicadPane { born: std::time::Instant::now(), handoff_placed: None, handoff_over: false, host_sent: None, mac_full: false, mac_raise: RaiseState::default(), mac_buried: false, mac_watching: false, mac_hot: None, mac_seen: (false, None), busy_sent: None, press_in: false, press_gave_keys: false, want_gerbers: Vec::new(), bound: String::new(), project, root, project_id, open, last_hub_open: hub_open, hub, container: None, toplevel: 0, attached: false, info: Value::Null, frames: Vec::new(), marker: Arc::default(), last_root: (i32::MIN, 0), placed: None,
+        KicadPane { born: std::time::Instant::now(), handoff_placed: None, handoff_over: false, host_sent: None, mac_full: false, mac_raise: RaiseState::default(), mac_buried: false, mac_watching: false, mac_hot: None, mac_seen: (false, None), mac_pressed: false, mac_looked: None, busy_sent: None, press_in: false, press_gave_keys: false, want_gerbers: Vec::new(), bound: String::new(), project, root, project_id, open, last_hub_open: hub_open, hub, container: None, toplevel: 0, attached: false, info: Value::Null, frames: Vec::new(), marker: Arc::default(), last_root: (i32::MIN, 0), placed: None,
             focus: cx.focus_handle(), keys: false, light: false, _subs: Vec::new(), kept: 0, press: Vec::new(), lent_at: None, poked: None, unmapped_since: None, unshown_since: None, override_kind: None, pending_show: None, theme_sent: false, home: 0, conflicts: Vec::new(), jobs: Vec::new(), ever_shown: Vec::new(), prewarmed: None, first_placed: None, at_px: None, dialogs_open: Vec::new(), took: None, await_close: None, press_focus: None, want_keys: true, refocus: None, verify_handin: None, prewarm_guard: None, unexplained_reposted: false, focus_seen: (0, 0), was_dialog: false, starting_since: None, starting_said: 0 }
     }
     fn rpc(&self, name: &str, params: Value) { let _ = self.hub.try_send(Command::Rpc(name.to_string(), Secret(params), "kicad")); }
@@ -1171,14 +1187,14 @@ impl KicadPane {
         let seen = (nc::host_key(self.toplevel), show);
         if seen != self.mac_seen { self.mac_seen = seen; self.mac_heat(); }
         let (true, Some(f)) = (visible, show) else { self.mac_raise = RaiseState::default(); self.mac_buried = false; return was };
-        let above = nc::frame_above(self.toplevel, f); let on = above || nc::frame_on_screen(f);
-        match raise_step(above, on, &mut self.mac_raise, &mut self.mac_buried, std::time::Instant::now()) {
+        let plan = order_plan(&nc::stack(self.toplevel, f));
+        match raise_step(plan == OrderPlan::Above, plan != OrderPlan::Idle, &mut self.mac_raise, &mut self.mac_buried, std::time::Instant::now()) {
             RaiseStep::Retry(n) => {
                 let before = nc::stacking(self.toplevel, f);
-                // another app's window between the frame and ours: ours never goes under it (only KiCad's own order can bring the
-                // frame up to us; once it is right below ours, the next check orders ours below it)
-                let sunk = nc::others_between(self.toplevel, f);
-                let ordered = !sunk && nc::order_below(self.toplevel, f);
+                // THE RULE (order_plan): ours goes below the frame only past our own and KiCad's windows; with another app's window
+                // between, nothing of ours moves, and KiCad is asked to bring its own frame to just above ours
+                let sunk = plan == OrderPlan::AskKicad;
+                let ordered = plan == OrderPlan::OursBelow && nc::order_below(self.toplevel, f);
                 let kicad_active = nc::has_focus(0);
                 let also = sunk || raise_also_kicad(&std::env::var("BACKPLANE_KICAD_MAC_RAISE").unwrap_or_default(), kicad_active, n);
                 if let (true, Some((x, y, w, h, v))) = (also, self.host_sent) {
@@ -1201,6 +1217,17 @@ impl KicadPane {
     /// the keyboard or shows a frame: none of it draws a frame of ours). Answers when to look again, in ms.
     #[cfg(target_os = "macos")]
     fn mac_watch(&mut self, cx: &mut Context<Self>) -> u64 {
+        // BACKPLANE_KICAD_MAC_WATCH=off (the e2e's A/B only): no look between our frames, as before Nov 16
+        if std::env::var("BACKPLANE_KICAD_MAC_WATCH").is_ok_and(|v| v == "off") { return 1000 }
+        // a press brings our window in front of the frame, and one on the title bar or an edge draws no frame of ours (the gate's blank
+        // pane: a press on the resize corner of a window that could not grow): the button going down is seen here within a frame's time
+        let pressed = nc::mouse_down();
+        if pressed != self.mac_pressed { self.mac_pressed = pressed; self.mac_heat(); }
+        let hot = self.mac_hot.is_some_and(|t| t > std::time::Instant::now());
+        // the list itself is read at raise_watch_ms' pace; between its looks only the button is
+        let due = raise_watch_ms(self.mac_raise.tries, self.mac_buried, hot);
+        if self.mac_looked.is_some_and(|t| (t.elapsed().as_millis() as u64) + 5 < due) { return 33 }
+        self.mac_looked = Some(std::time::Instant::now());
         // only a pane with its editor placed over it (not back in View, not before the first push)
         if let (Some(_), Some((.., sent_visible))) = (self.container, self.host_sent) {
             let show = self.want();
@@ -1209,7 +1236,7 @@ impl KicadPane {
             if visible != sent_visible { cx.notify(); }
             else if self.mac_order(show, visible, "watch") { cx.notify(); } // i18n-ok: a log word
         }
-        raise_watch_ms(self.mac_raise.tries, self.mac_buried, self.mac_hot.is_some_and(|t| t > std::time::Instant::now()))
+        33
     }
     /// Back to the viewer: the editor's windows leave the pane (KiCad stays warm in the hub).
     pub fn detach(&mut self) {
@@ -1373,6 +1400,46 @@ mod tests {
         }
         assert_eq!(raise_step(false, true, &mut st, &mut buried, t), RaiseStep::Retry(n + 1));
         assert!(buried, "flapping past the bound is said");
+    }
+    /// THE RULE: the client orders its own window only, and never over or under another app's.
+    #[test] fn the_client_orders_only_its_own_window_and_never_past_another_apps() {
+        use super::{order_plan, OrderPlan::*, Who::*};
+        // the frame above ours, KiCad's dialogs over it or between: well
+        assert_eq!(order_plan(&[Frame, Ours]), Above);
+        assert_eq!(order_plan(&[Kicad, Frame, Kicad, Ours, Other]), Above);
+        // behind ours (a press brought ours up), nothing or only our own and KiCad's windows between: ours goes below the frame
+        assert_eq!(order_plan(&[Ours, Frame]), OursBelow);
+        assert_eq!(order_plan(&[Other, Ours, OurOther, Kicad, Frame, Other]), OursBelow);
+        // another app's window between ours and the frame: ours would sink under it. Never: KiCad's to bring its frame up
+        assert_eq!(order_plan(&[Ours, Other, Frame]), AskKicad);
+        assert_eq!(order_plan(&[Ours, Kicad, Other, OurOther, Frame]), AskKicad);
+        // the frame above another app's window that is above ours: ours would jump over that window. Never: KiCad's to bring it down
+        assert_eq!(order_plan(&[Frame, Other, Ours]), AskKicad);
+        // one of our own other windows between the frame and ours: not ours to reorder under it by moving the main window; KiCad's
+        assert_eq!(order_plan(&[Frame, OurOther, Ours]), AskKicad);
+        // the frame or our window not on screen: nothing
+        assert_eq!(order_plan(&[Ours, Other]), Idle);
+        assert_eq!(order_plan(&[Other, Frame]), Idle);
+        assert_eq!(order_plan(&[]), Idle);
+        // every arrangement of five windows: ours is moved only when no other app's window lies between it and the frame, so the
+        // move (to just below the frame) crosses none
+        let all = [Ours, Frame, Kicad, OurOther, Other];
+        for a in 0..5 { for b in 0..5 { for c in 0..5 { for d in 0..5 { for e in 0..5 {
+            let st = [all[a], all[b], all[c], all[d], all[e]];
+            if st.iter().filter(|w| **w == Ours).count() != 1 || st.iter().filter(|w| **w == Frame).count() != 1 { continue }
+            let (u, f) = (st.iter().position(|w| *w == Ours).unwrap(), st.iter().position(|w| *w == Frame).unwrap());
+            if order_plan(&st) == OursBelow { assert!(u < f && !st[u + 1..f].contains(&Other), "{st:?}"); }
+        } } } } }
+    }
+    /// The only window the macOS module ever orders is our own: one call site, on our own NSWindow, below the frame.
+    #[test] fn the_macos_module_orders_no_window_but_ours() {
+        let src = include_str!("native_child_mac.rs");
+        let code: Vec<&str> = src.lines().filter(|l| !l.trim_start().starts_with("//")).collect();
+        let orders: Vec<&&str> = code.iter().filter(|l| l.contains("orderWindow:") || l.contains("orderFront") || l.contains("orderBack") || l.contains("orderOut") || l.contains("setLevel")).collect();
+        assert_eq!(orders.len(), 1, "{orders:?}");
+        assert!(orders[0].contains("ns_window(top)") && orders[0].contains("NSWindowBelow"), "{orders:?}");
+        // and it reaches a window only through our own app's table (windowWithWindowNumber: answers nil for anyone else's)
+        assert!(src.contains(r#"fn ns_window(n: u64) -> *mut c_void { unsafe { send_isize_arg(app(), c"windowWithWindowNumber:", n as isize) } }"#));
     }
     #[test] fn kicad_is_asked_to_order_its_frame_only_when_that_can_help() {
         use super::{raise_also_kicad, raise_watch_ms};

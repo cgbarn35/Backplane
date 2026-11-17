@@ -271,10 +271,13 @@ if os.environ.get('MAC_MODE') == 'update':
 hub = subprocess.Popen([HUB, '--home', os.path.join(OUT, 'home'), '--port', str(port), '--host', '127.0.0.1', '--no-tailscale', '--foreground'],
                        env=env, stdout=open(os.path.join(OUT, 'hub.log'), 'w'), stderr=subprocess.STDOUT); procs.append(hub)
 wait_for(lambda: subprocess.run(['curl', '-s', '-m1', '-o', '/dev/null', f'http://127.0.0.1:{port}/hello']).returncode == 0, 30)
-script = [{"select": 0}, {"wait": 2500}, {"click": "rail:Board"}, {"wait": 2500}, {"click": "ui:Edit"}, {"wait": 900000}]
+# the client leaves when its script ends: longer than the longest mode (front: 36 rows of 10; Nov 16: it ended at 900 s, mid-run,
+# and the run went on clicking where its window had been)
+CLIENT_WAIT_MS = 5400000 if os.environ.get('MAC_MODE') == 'front' else 900000
+script = [{"select": 0}, {"wait": 2500}, {"click": "rail:Board"}, {"wait": 2500}, {"click": "ui:Edit"}, {"wait": CLIENT_WAIT_MS}]
 json.dump(script, open(os.path.join(OUT, 'script.json'), 'w'))
 cenv = dict(os.environ, HOME=os.path.join(OUT, 'fh'), BACKPLANE_GPUI_ASSETS=ASSETS, BACKPLANE_GPUI_RECTS='1', BACKPLANE_KICAD_DEBUG='1')
-client = subprocess.Popen([CLIENT, '--url', f'http://127.0.0.1:{port}', '--token-file', os.path.join(OUT, 'home/token'), '--script', os.path.join(OUT, 'script.json'), '--exit-after', '900'],
+client = subprocess.Popen([CLIENT, '--url', f'http://127.0.0.1:{port}', '--token-file', os.path.join(OUT, 'home/token'), '--script', os.path.join(OUT, 'script.json'), '--exit-after', str(CLIENT_WAIT_MS // 1000)],
                           env=cenv, stdout=open(os.path.join(OUT, 'client.log'), 'w'), stderr=subprocess.STDOUT); procs.append(client)
 
 
@@ -1067,15 +1070,23 @@ try:
     # ---- MAC_MODE=front: KiCad's frame is the front-most window over the pane's rect (the gate's blank pane, Nov 16: at a 967 pt pane
     # in a 1900 pt window the frame sat at the pane's rect but behind Backplane's window). Pane widths 611, 967 and the widest the
     # display allows, the sidebar folded and open, the board and the schematic; after Edit (View, then Edit), after a click in
-    # Backplane's chrome and one back in the pane, after a tab switch and back: FRONT_REPS (10) of each, every one judged by the
+    # Backplane's chrome and one back in the pane, after two presses on Backplane's title bar and none back, after a tab switch and back: FRONT_REPS (10) of each, every one judged by the
     # window server's list (the helper's, front first) three times over 0.6 s: the first normal window that touches the pane's rect
     # is KiCad's, at the pane's rect within 2 pt. A width the display cannot give with the sidebar open is said, not failed.
     if os.environ.get('MAC_MODE') == 'front':
         REPS = int(os.environ.get('FRONT_REPS', '10'))
-        SCREEN_W = int(os.environ.get('FRONT_SCREEN_W', '1920'))  # the window never past the display's right edge
+        # the window never past the display's right edge
+        if os.environ.get('FRONT_SCREEN_W'): SCREEN_W = int(os.environ['FRONT_SCREEN_W'])
+        elif DRIVER == 'quartz': SCREEN_W = int(Quartz.CGDisplayPixelsWide(Quartz.CGMainDisplayID()))
+        else: SCREEN_W = 1920
+        WIDEST = min(1900, SCREEN_W - 20)
+        print(f'INFO front: display {SCREEN_W} pt wide, widest window {WIDEST}', flush=True)
+        def alive():
+            if client.poll() is not None: raise SystemExit(f'STOPPED front: the client has exited ({client.returncode}); nothing more is clicked or typed')
         def ours():
             # never the window's last known place: a window that is not in the list now is not clicked, sized or typed at (Nov 16: the
             # lookup was lost and the run's clicks went to the person's own windows)
+            alive()
             w = next((w for w in wins() if w[0] == cw[0] and w[1] == client.pid), None)
             if not w: raise SystemExit(f"STOPPED front: Backplane's window {cw[0]} is not on screen; nothing more is clicked or typed")
             return w[3]
@@ -1113,7 +1124,7 @@ try:
         def pane_to(target):
             """The pane to `target` pt wide by the window's width (None: the widest window the display gives); the width reached."""
             if target is None:
-                b = ours(); win_size(client.pid, min(1900, SCREEN_W - b[0]), b[3]); time.sleep(2.5); ours()
+                b = ours(); win_size(client.pid, min(WIDEST, SCREEN_W - b[0]), b[3]); time.sleep(2.5); ours()
                 return last_push()[0][2] if last_push() else None
             slope, prev = 1.0, None
             for _ in range(8):
@@ -1121,7 +1132,7 @@ try:
                 if not p or abs(p[0][2] - target) <= 3: break
                 if prev and b[2] != prev[0] and p[0][2] != prev[1]: slope = max(0.2, min(2.0, (p[0][2] - prev[1]) / (b[2] - prev[0])))
                 prev = (b[2], p[0][2])
-                win_size(client.pid, max(500, min(1900, SCREEN_W - b[0], round(b[2] + (target - p[0][2]) / slope))), b[3]); time.sleep(2.0); ours()
+                win_size(client.pid, max(500, min(WIDEST, SCREEN_W - b[0], round(b[2] + (target - p[0][2]) / slope))), b[3]); time.sleep(2.0); ours()
             time.sleep(1.0)
             return last_push()[0][2] if last_push() else None
         def tab_now(): return 'SCH' if '"to":"SCH"' in ([l for l in client_log().splitlines() if '"kicad_tab"' in l] or [''])[-1] else 'PCB'
@@ -1138,7 +1149,28 @@ try:
         def after_tab(tab):
             other = 'SCH' if tab == 'PCB' else 'PCB'
             to_tab(other); to_tab(tab)
-        if os.environ.get('ZTRACE'): helper(f'trace {client.pid} {kpid} {os.path.join(OUT, "ztrace.txt")} 3600')
+        def after_press():
+            # the gate's blank pane: a press on our window that draws nothing of ours (its title bar, while Backplane already has the
+            # keyboard) brings it in front of the frame; nothing is clicked after it: the client must put the frame back by itself
+            b = ours(); click(b[0] + b[2] / 2, b[1] + 14); time.sleep(0.9); click(b[0] + b[2] / 2 + 6, b[1] + 14); time.sleep(0.5)
+        if os.environ.get('ZTRACE') and DRIVER == 'vnc': helper(f'trace {client.pid} {kpid} {os.path.join(OUT, "ztrace.txt")} 5400')
+        elif os.environ.get('ZTRACE'):
+            # the runner has no gate helper: the same 60 Hz trace from here (ms, then the normal windows front to back down to the later
+            # of ours and KiCad's: number:a|b|o:bounds, a = the client, b = KiCad, o = anyone else), a line on each change
+            import threading
+            def ztrace():
+                t0, last = time.time(), None
+                with open(os.path.join(OUT, 'ztrace.txt'), 'w') as f:
+                    while client.poll() is None:
+                        row, seen = [], set()
+                        for w in wins():
+                            tag = 'a' if w[1] == client.pid else 'b' if w[1] == kpid else 'o'
+                            row.append(f'{w[0]}:{tag}:{",".join(map(str, w[3]))}'); seen.add(tag)
+                            if {'a', 'b'} <= seen: break
+                        line = ' '.join(row)
+                        if line != last: f.write(f'{round((time.time() - t0) * 1000)} {line}\n'); f.flush(); last = line
+                        time.sleep(1 / 60)
+            threading.Thread(target=ztrace, daemon=True).start()
         n_log = lambda what: client_log().count(what)
         for fold_on in (False, True):
             for target in (611, 967, None):
@@ -1148,7 +1180,7 @@ try:
                     print(f'INFO front {name}: the display gives a {got} pt pane with the sidebar {"folded" if fold_on else "open"}, not {target}: judged at {got}', flush=True)
                 for tab in ('PCB', 'SCH'):
                     to_tab(tab); wait_for(kicad_frame, 30, 0.5); time.sleep(2)
-                    for step, act in (('edit', after_edit), ('chrome', after_chrome), ('tab', lambda: after_tab(tab))):
+                    for step, act in (('edit', after_edit), ('chrome', after_chrome), ('press', after_press), ('tab', lambda: after_tab(tab))):
                         good, why = 0, []
                         for i in range(REPS):
                             skip = act()
