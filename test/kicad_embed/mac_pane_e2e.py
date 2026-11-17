@@ -103,7 +103,20 @@ else:
         mods = [m for m, bit in (('ctrl', CTRL), ('alt', ALT), ('shift', SHIFT), ('cmd', CMD)) if flags & bit]
         relay(op='chord', combo='+'.join(mods + [KEYNAME[code]]))
 
-    def click(x, y, button='left'): relay(op='click', x=x, y=y, button=1 if button == 'left' else 3)
+    # never a click on the person's windows: the front-most window at the point (any layer) must be this run's Backplane or KiCad,
+    # else the run stops (the Mac mini gate, Nov 16: a lost window lookup sent clicks to the person's Chrome and Music)
+    def _our_pids():
+        ps = subprocess.run(['ps', '-axo', 'pid=,command='], capture_output=True, text=True).stdout.splitlines()
+        return {client.pid} | {int(l.split()[0]) for l in ps if OUT in l and 'kicad' in l.lower()}
+    def _guard(x, y, what):
+        mine = _our_pids()
+        for w in helper('windows') or []:
+            bx, by, bw, bh = w['bounds']
+            if bx <= x < bx + bw and by <= y < by + bh and w.get('layer', 0) < 1000:
+                if int(w['pid']) in mine: return
+                raise SystemExit(f'REFUSED {what} at ({round(x)}, {round(y)}): the window there is {w.get("owner", "?")}\'s, not this run\'s')
+        raise SystemExit(f'REFUSED {what} at ({round(x)}, {round(y)}): no window of this run there')
+    def click(x, y, button='left'): _guard(x, y, 'a click'); relay(op='click', x=x, y=y, button=1 if button == 'left' else 3)
     def shot_to(path):
         # only the test's own windows (Backplane's and KiCad's), never the screen: their union's bounds
         ours = [w for w in wins() if w[1] == client.pid or 'kicad' in w[2].lower() and OUT in ' '.join(subprocess.run(['ps', '-o', 'command=', '-p', str(w[1])], capture_output=True, text=True).stdout.split()[:1] or [''])]
@@ -118,15 +131,16 @@ else:
     def _main(pid): return max((w for w in wins() if w[1] == pid), key=lambda w: w[3][2] * w[3][3], default=None)
 
     def win_move(pid, x, y):
-        b = _main(pid)[3]; relay(op='drag', x0=b[0] + 120, y0=b[1] + 12, x1=x + 120, y1=y + 12, seconds=0.8); time.sleep(0.5)
+        b = _main(pid)[3]; _guard(b[0] + 120, b[1] + 12, 'a drag'); relay(op='drag', x0=b[0] + 120, y0=b[1] + 12, x1=x + 120, y1=y + 12, seconds=0.8); time.sleep(0.5)
 
     def win_size(pid, w, h):
-        b = _main(pid)[3]; relay(op='drag', x0=b[0] + b[2] - 2, y0=b[1] + b[3] - 2, x1=b[0] + w - 2, y1=b[1] + h - 2, seconds=0.8); time.sleep(0.5)
+        b = _main(pid)[3]; _guard(b[0] + b[2] - 2, b[1] + b[3] - 2, 'a drag'); relay(op='drag', x0=b[0] + b[2] - 2, y0=b[1] + b[3] - 2, x1=b[0] + w - 2, y1=b[1] + h - 2, seconds=0.8); time.sleep(0.5)
 
     def win_full(pid, on):
         if on:
             # the window active first (its title bar): a click on an inactive window's green button only activates it
-            b = _main(pid)[3]; relay(op='click', x=b[0] + 120, y=b[1] + 12); time.sleep(0.6); relay(op='click', x=b[0] + 58, y=b[1] + 13)
+            b = _main(pid)[3]; _guard(b[0] + 120, b[1] + 12, 'a click'); relay(op='click', x=b[0] + 120, y=b[1] + 12); time.sleep(0.6)
+            _guard(b[0] + 58, b[1] + 13, 'a click'); relay(op='click', x=b[0] + 58, y=b[1] + 13)
         else:
             # as a person leaves full screen: the pointer at the screen's top shows the title bar, then its green button
             # (Ctrl+Cmd+F needs an Exit Full Screen menu item; the client has none)
@@ -139,7 +153,7 @@ else:
                 if wait_for(lambda: client_log().count('"kicad_mac_full_screen":false') > n0, 4): break
                 relay(op='chord', combo='escape'); time.sleep(0.8)  # whatever opened instead (a menu) goes
 
-    def win_close(pid, bounds): relay(op='click', x=bounds[0] + 14, y=bounds[1] + 13)
+    def win_close(pid, bounds): _guard(bounds[0] + 14, bounds[1] + 13, 'a click'); relay(op='click', x=bounds[0] + 14, y=bounds[1] + 13)
 
 
 CLIENT, HUB, ASSETS, RT, OUT = sys.argv[1:6]
@@ -722,6 +736,27 @@ try:
             def ed(n): r = edits_since(n); return sum(c for c, d in r), sum(d for c, d in r)
             def wait_ed(n, want):  # want: 'c' or 'd'
                 wait_for(lambda: (ed(n)[0] if want == 'c' else ed(n)[1]) > 0, W); time.sleep(0.4); return ed(n)
+            def mcalls(): return [l for l in open(os.path.join(OUT, 'standin.log'), errors='replace').read().splitlines() if l.startswith('MCPCALL')] if os.path.isfile(os.path.join(OUT, 'standin.log')) else []
+            def ask(name, args, wait=60):
+                n0 = len(mcalls())
+                hub_ws.send(port, token, 'turn.start', {'thread': 't1', 'text': 'mcpcall:' + json.dumps({'name': name, 'arguments': args}), 'msg': f'as-{time.time_ns()}'})
+                wait_for(lambda: len(mcalls()) > n0, wait, 0.3)
+                l = mcalls()[-1] if len(mcalls()) > n0 else ''
+                try: return json.loads(json.loads(l.split(' ', 2)[2])['result']['content'][0]['text'])
+                except Exception: return {'raw': l[:300]}
+            REAL = {'pcb': ['KOT_PCB_FOOTPRINT', 'KOT_PCB_SHAPE', 'KOT_PCB_TEXT', 'KOT_PCB_TRACE', 'KOT_PCB_VIA', 'KOT_PCB_ARC', 'KOT_PCB_ZONE'],
+                    'sch': ['KOT_SCH_JUNCTION', 'KOT_SCH_NO_CONNECT', 'KOT_SCH_LINE', 'KOT_SCH_TEXT', 'KOT_SCH_LABEL', 'KOT_SCH_GLOBAL_LABEL', 'KOT_SCH_HIER_LABEL', 'KOT_SCH_SYMBOL']}
+            MARK = {'pcb': 'KOT_PCB_MARKER', 'sch': 'KOT_SCH_MARKER'}
+            def agent_items(E, f):  # an agent's read through the hub (GetItems): ({@type: count}, answered?, what it said)
+                C = 'kiapi.common.commands.'
+                d = ask('kicad_ipc', {'path': f, 'type': C + 'GetOpenDocuments', 'message': {'type': 'DOCTYPE_PCB' if E == 'pcb' else 'DOCTYPE_SCHEMATIC'}})
+                doc = ((d.get('message') or {}).get('documents') or [None])[0]
+                r = ask('kicad_ipc', {'path': f, 'type': C + 'GetItems', 'message': {'header': {'document': doc}, 'types': REAL[E] + [MARK[E]]}})
+                items = (r.get('message') or {}).get('items')
+                if items is None: return {}, False, str(r)[:160]
+                byk = {}
+                for it in items: k = str(it.get('@type', '?')).rsplit('.', 1)[-1]; byk[k] = byk.get(k, 0) + 1
+                return byk, True, ''
             ROWS = []
             def row(ed_, rid, verdict, detail, t0=None):
                 tl = [l.split('macos: ', 1)[-1] for l in tr()[t0:]] if t0 is not None else []
@@ -759,6 +794,36 @@ try:
                 m = seq(); key(K_Z, CMD); wait_ed(m, 'c'); settle(m)
                 row(E, 'undo_10', 'works' if nu == 10 else ('nothing' if nu == 0 else 'wrong'), f'Cmd+Z undid {nu} of 10')
                 row(E, 'redo_10', 'works' if nr == 10 else ('nothing' if nr == 0 else 'wrong'), f'Cmd+Shift+Z redid {nr} of 10')
+                # undo_markers (fork d2ce4ba5c6): a check's markers in select all; Delete, undo, redo, undo; a check and an agent read between each
+                kwins0 = {w[0] for w in wins() if w[1] == kpid}
+                notes, bad = [], []
+                def real(byk): return {k: v for k, v in byk.items() if 'Marker' not in k}
+                rc = ask('kicad_ipc', {'path': f, 'type': 'kiapi.backplane.embed.RunChecks', 'message': {'kind': 'FK_PCB' if E == 'pcb' else 'FK_SCH'}})
+                ran_direct = 'message' in rc
+                def between(tag):
+                    n = seq()
+                    if ran_direct: ask('kicad_ipc', {'path': f, 'type': 'kiapi.backplane.embed.RunChecks', 'message': {'kind': 'FK_PCB' if E == 'pcb' else 'FK_SCH'}})
+                    done = checks_idle(n, 30)
+                    byk, ok, said = agent_items(E, f)
+                    notes.append(f'{tag}: check {"done" if done else "no ET_CHECKS_DONE"}, markers {sum(v for k, v in byk.items() if "Marker" in k)}, agent read {"ok" if ok else "FAILED " + said}')
+                    if not ok: bad.append(f'the agent read after {tag} failed')
+                    return real(byk)
+                c0 = between('start')
+                canvas(); key(K_A, CMD); time.sleep(0.6)
+                def mstep(tag, code, fl, back):
+                    n = seq(); key(code, fl); c, d = wait_ed(n, 'c' if back else 'd'); settle(n)
+                    now = between(tag)
+                    if back and now != c0: bad.append(f'after {tag} not every real item is back: {now} (was {c0})')
+                    if not back and sum(now.values()) >= sum(c0.values()): bad.append(f'after {tag} items remain: {now}')
+                    if not (c or d): bad.append(f'{tag}: no edit')
+                    notes.append(f'{tag}: created {c} deleted {d}, real items {sum(now.values())}')
+                mstep('delete', K_FDEL, 0, False); mstep('undo', K_Z, CMD, True)
+                mstep('redo', K_Z, CMD | SHIFT, False); mstep('undo again', K_Z, CMD, True)
+                newk = [w for w in wins() if w[1] == kpid and w[0] not in kwins0]
+                if newk: bad.append(f'KiCad showed {len(newk)} new window(s): {[w[3] for w in newk]}')
+                for nl in notes: print(f'INFO undo_markers {E}: {nl}', flush=True)
+                print(f'INFO undo_markers {E}: checks {"run through the hub (RunChecks)" if ran_direct else "KiCad\'s own after each edit (RunChecks refused through the hub: " + str(rc)[:100] + ")"}', flush=True)
+                row(E, 'undo_markers', 'works' if not bad else ('nothing' if all(b.endswith('no edit') for b in bad) else 'wrong'), ('; '.join(bad) or f'every real item back at each undo ({sum(c0.values())}: {c0}), no dialog'))
                 if not undo_ok:
                     print(f'INFO {E}: undo is nothing, so the rows after it run on what is left (no restore): judge them with that in mind', flush=True)
                 canvas(); key(K_A, CMD); time.sleep(0.5)
@@ -828,15 +893,6 @@ try:
             board_click(0.1, 0.9)
             go = table('pcb', pcbf)
             if go:  # per_actor_undo (PCB): the person deletes everything, an agent's track lands (save: false), the person's Cmd+Z
-                port_ = port
-                def mcalls(): return [l for l in open(os.path.join(OUT, 'standin.log'), errors='replace').read().splitlines() if l.startswith('MCPCALL')] if os.path.isfile(os.path.join(OUT, 'standin.log')) else []
-                def ask(name, args, wait=60):
-                    n0 = len(mcalls())
-                    hub_ws.send(port_, token, 'turn.start', {'thread': 't1', 'text': 'mcpcall:' + json.dumps({'name': name, 'arguments': args}), 'msg': f'as-{time.time_ns()}'})
-                    wait_for(lambda: len(mcalls()) > n0, wait, 0.3)
-                    l = mcalls()[-1] if len(mcalls()) > n0 else ''
-                    try: return json.loads(json.loads(l.split(' ', 2)[2])['result']['content'][0]['text'])
-                    except Exception: return {'raw': l[:300]}
                 canvas(); key(K_A, CMD); time.sleep(0.5); n = seq(); key(K_FDEL); wait_ed(n, 'd'); settle(n)
                 C = 'kiapi.common.commands.'
                 docs = ask('kicad_ipc', {'path': pcbf, 'type': C + 'GetOpenDocuments', 'message': {'type': 'DOCTYPE_PCB'}})
