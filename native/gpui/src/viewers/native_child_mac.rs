@@ -4,8 +4,8 @@
 //! fork's `SetHostGeometry`), ordered just above our window. Measured on the prototype and on real KiCad (test/kicad_embed/mac,
 //! scripts/backplane-embed-macos-check.py in the fork):
 //! - the "container" is our own window's number (CGWindowID): what KiCad orders its frames above;
-//! - a click or an activation raises our window over KiCad's frame with no other notice: after every frame of ours, `keep_below`
-//!   orders our window just below the frame on show again when something else is right above us (one frame of gap, ~11 ms);
+//! - a click or an activation raises our window over KiCad's frame with no other notice: after every frame of ours and on a timer between them, the pane (`mac_order`)
+//!   orders our window just below the frame on show again when the window list does not show the frame above us, and checks that it held;
 //! - the keyboard goes to KiCad by activating its app from here (macOS 14+ lets the active app activate another; KiCad's own
 //!   `activate` from the background is ignored there), and back by activating ours;
 //! - the frame must leave the screen when our window cannot be seen (minimised, full screen: another app's window cannot join our
@@ -96,23 +96,41 @@ pub fn host_full_screen(top: u64) -> bool {
     unsafe { let w = ns_window(top); if w.is_null() { return false } const FULL_SCREEN: usize = 1 << 14; send_usize(w, c"styleMask") & FULL_SCREEN != 0 }
 }
 
-/// After a click or an activation our window is above KiCad's frame `frame`: order ours just below it again (no IPC; KiCad keeps its
-/// frame directly above us otherwise). True when it re-ordered.
-pub fn keep_below(top: u64, frame: u64) -> bool {
+/// Whether KiCad's frame `frame` is above our window `top`, with only KiCad's own windows (its dialogs over the frame) between: asked of
+/// the window server's list, never taken from what we last asked for. A KiCad dialog between ours and the frame counted as another app's
+/// window once: ours went below the frame and buried the dialog under it (run 18: Find open but unseen, its Escape never reached it).
+pub fn frame_above(top: u64, frame: u64) -> bool {
     if frame == 0 { return false }
-    // the normal windows just above ours, nearest first: KiCad's own (its dialogs, over the frame) up to the frame, or nothing to do.
-    // A KiCad dialog between ours and the frame counted as another app's window: ours went below the frame and buried the dialog under
-    // it (run 18: Find open but unseen, its Escape never reached it)
     let kicad = match owner(frame) { 0 => KICAD_PID.load(std::sync::atomic::Ordering::Relaxed), p => p };
     for e in list(ON_SCREEN_ABOVE | EXCLUDE_DESKTOP, top).into_iter().rev().filter(|e| e.2 == 0) {
-        if e.0 == frame { return false }
-        if e.1 != kicad { break }
+        if e.0 == frame { return true }
+        if e.1 != kicad { return false }
     }
-    // only when the frame is on screen at all (hidden by KiCad or by us: nothing to order)
-    if !list(ON_SCREEN_ABOVE | EXCLUDE_DESKTOP, 0).iter().any(|e| e.0 == frame) { return false }
+    false
+}
+/// The frame is on screen at all (hidden by KiCad or by us: nothing to order).
+pub fn frame_on_screen(frame: u64) -> bool { frame != 0 && list(ON_SCREEN_ABOVE | EXCLUDE_DESKTOP, 0).iter().any(|e| e.0 == frame) }
+/// For a log line: the on-screen normal windows front to back as (number, whose), ours `u`, the frame `f`, KiCad's other windows `k`,
+/// anyone else's `o`; up to the later of the two (no titles, no bounds: nothing of the person's windows but that they are there).
+pub fn stacking(top: u64, frame: u64) -> String {
+    let kicad = match owner(frame) { 0 => KICAD_PID.load(std::sync::atomic::Ordering::Relaxed), p => p };
+    let mut out = Vec::new(); let mut seen = 0;
+    for e in list(ON_SCREEN_ABOVE | EXCLUDE_DESKTOP, 0).into_iter().filter(|e| e.2 == 0) {
+        let tag = if e.0 == top { seen += 1; "u" } else if e.0 == frame { seen += 1; "f" } else if e.1 == kicad { "k" } else if e.1 == own_pid() { "b" } else { "o" };
+        out.push(format!("{}{}", tag, e.0));
+        if seen == 2 { break }
+    }
+    out.join(" ")
+}
+/// Order our window just below KiCad's frame `frame` (ours to do whether or not we are the active app). False when our window is gone.
+/// Whether it took, and held, is `frame_above` a moment later (kicad_pane's `mac_order`).
+pub fn order_below(top: u64, frame: u64) -> bool {
+    if frame == 0 { return false }
     unsafe { let w = ns_window(top); if w.is_null() { return false } send_order(w, c"orderWindow:relativeTo:", -1 /* NSWindowBelow */, frame as isize); }
     true
 }
+/// Our window is the key window (it has our app's keyboard): a change of it comes with orders from both sides.
+pub fn host_key(top: u64) -> bool { unsafe { let w = ns_window(top); !w.is_null() && send_bool(w, c"isKeyWindow") } }
 
 fn running_app(pid: i64) -> *mut c_void { unsafe { send_i32_arg(class(c"NSRunningApplication"), c"runningApplicationWithProcessIdentifier:", pid as i32) } } // i18n-ok: an Objective-C class name
 fn own_pid() -> i64 { std::process::id() as i64 }
