@@ -1175,16 +1175,19 @@ impl KicadPane {
         match raise_step(above, on, &mut self.mac_raise, &mut self.mac_buried, std::time::Instant::now()) {
             RaiseStep::Retry(n) => {
                 let before = nc::stacking(self.toplevel, f);
-                let ordered = nc::order_below(self.toplevel, f);
+                // another app's window between the frame and ours: ours never goes under it (only KiCad's own order can bring the
+                // frame up to us; once it is right below ours, the next check orders ours below it)
+                let sunk = nc::others_between(self.toplevel, f);
+                let ordered = !sunk && nc::order_below(self.toplevel, f);
                 let kicad_active = nc::has_focus(0);
-                let also = raise_also_kicad(&std::env::var("BACKPLANE_KICAD_MAC_RAISE").unwrap_or_default(), kicad_active, n);
+                let also = sunk || raise_also_kicad(&std::env::var("BACKPLANE_KICAD_MAC_RAISE").unwrap_or_default(), kicad_active, n);
                 if let (true, Some((x, y, w, h, v))) = (also, self.host_sent) {
                     self.rpc("editor.kicad.host", json!({"project": self.project, "x": x, "y": y, "width": w, "height": h, "visible": v, "raise": true}));
                 }
                 let said = self.mac_buried && !was;
                 if n <= 8 || n % 30 == 0 || said {
                     eprintln!("GPUI_LOG {}", json!({"kicad_mac_order": {"try": n, "by": by, "ms": self.mac_raise.since.map_or(0, |t| t.elapsed().as_millis() as u64), "top": self.toplevel, "frame": f,
-                        "ordered": ordered, "key": seen.0, "kicad_active": kicad_active, "raise_kicad": also, "before": before, "after": nc::stacking(self.toplevel, f), "at_ms": crate::screens::kcomment::epoch_ms() as u64}}));
+                        "ordered": ordered, "others_between": sunk, "key": seen.0, "kicad_active": kicad_active, "raise_kicad": also, "before": before, "after": nc::stacking(self.toplevel, f), "at_ms": crate::screens::kcomment::epoch_ms() as u64}}));
                 }
                 if said { eprintln!("GPUI_LOG {}", json!({"kicad_mac_buried": {"tries": n, "top": self.toplevel, "frame": f, "stack": nc::stacking(self.toplevel, f)}})); }
                 self.mac_heat();

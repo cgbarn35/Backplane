@@ -1072,7 +1072,16 @@ try:
     # is KiCad's, at the pane's rect within 2 pt. A width the display cannot give with the sidebar open is said, not failed.
     if os.environ.get('MAC_MODE') == 'front':
         REPS = int(os.environ.get('FRONT_REPS', '10'))
-        def ours(): return next((w for w in wins() if w[0] == cw[0]), cw)[3]
+        SCREEN_W = int(os.environ.get('FRONT_SCREEN_W', '1920'))  # the window never past the display's right edge
+        def ours():
+            # never the window's last known place: a window that is not in the list now is not clicked, sized or typed at (Nov 16: the
+            # lookup was lost and the run's clicks went to the person's own windows)
+            w = next((w for w in wins() if w[0] == cw[0] and w[1] == client.pid), None)
+            if not w: raise SystemExit(f"STOPPED front: Backplane's window {cw[0]} is not on screen; nothing more is clicked or typed")
+            return w[3]
+        def keys_ours(what):
+            # a chord goes to whichever app has the keyboard: only when that is this run's Backplane or KiCad
+            if not (active(client.pid) or active(kpid)): raise SystemExit(f'STOPPED front: {what}: neither Backplane nor KiCad of this run is the active app')
         def touches(a, b): return a[0] < b[0] + b[2] and b[0] < a[0] + a[2] and a[1] < b[1] + b[3] and b[1] < a[1] + a[3]
         def front_once():
             """None when KiCad's frame is the front-most normal window over the pane's rect and at it; else what is wrong, in words."""
@@ -1100,11 +1109,11 @@ try:
         folded = [False]
         def fold(want):
             if folded[0] == want: return
-            b = ours(); click(b[0] + 20, b[1] + b[3] - 40); time.sleep(0.6); key(K_B, CMD); time.sleep(2.0); folded[0] = want
+            b = ours(); click(b[0] + 20, b[1] + b[3] - 40); time.sleep(0.6); keys_ours('Cmd+B'); key(K_B, CMD); time.sleep(2.0); folded[0] = want
         def pane_to(target):
             """The pane to `target` pt wide by the window's width (None: the widest window the display gives); the width reached."""
             if target is None:
-                b = ours(); win_size(client.pid, 1900, b[3]); time.sleep(2.5)
+                b = ours(); win_size(client.pid, min(1900, SCREEN_W - b[0]), b[3]); time.sleep(2.5); ours()
                 return last_push()[0][2] if last_push() else None
             slope, prev = 1.0, None
             for _ in range(8):
@@ -1112,7 +1121,7 @@ try:
                 if not p or abs(p[0][2] - target) <= 3: break
                 if prev and b[2] != prev[0] and p[0][2] != prev[1]: slope = max(0.2, min(2.0, (p[0][2] - prev[1]) / (b[2] - prev[0])))
                 prev = (b[2], p[0][2])
-                win_size(client.pid, max(500, min(1900, round(b[2] + (target - p[0][2]) / slope))), b[3]); time.sleep(2.0)
+                win_size(client.pid, max(500, min(1900, SCREEN_W - b[0], round(b[2] + (target - p[0][2]) / slope))), b[3]); time.sleep(2.0); ours()
             time.sleep(1.0)
             return last_push()[0][2] if last_push() else None
         def tab_now(): return 'SCH' if '"to":"SCH"' in ([l for l in client_log().splitlines() if '"kicad_tab"' in l] or [''])[-1] else 'PCB'
@@ -1145,7 +1154,12 @@ try:
                             skip = act()
                             if skip: why.append(skip); break
                             bad = front()
-                            if bad: why.append(f'{i + 1}: {bad[-1]}'); shot(f'front-{name}-{tab}-{step}-{i + 1}')
+                            if bad: why.append(f'{i + 1}: {bad[-1]}')
+                            # another app's window over the pane: this run's windows are no longer the front ones; it stops here (no
+                            # picture: the screen now shows windows that are not the run's)
+                            if any('another app' in b for b in bad):
+                                check(False, f'front: {tab}, sidebar {"folded" if fold_on else "open"}, pane {got} pt, after {step}, try {i + 1}: {bad[-1]}')
+                                raise SystemExit(f'STOPPED front: another app\'s window is over the pane; nothing more is clicked or typed')
                             else: good += 1
                         RES[f'front_{name}_{tab}_{step}'] = {'pane': got, 'good': good, 'of': REPS, 'why': why[:3]}
                         check(good == REPS, f'front: {tab}, sidebar {"folded" if fold_on else "open"}, pane {got} pt, after {step}: KiCad\'s frame is the front-most window over the pane {good} of {REPS}{" (" + "; ".join(why[:3]) + ")" if why else ""}')

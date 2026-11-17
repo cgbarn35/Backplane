@@ -129,6 +129,17 @@ pub fn order_below(top: u64, frame: u64) -> bool {
     unsafe { let w = ns_window(top); if w.is_null() { return false } send_order(w, c"orderWindow:relativeTo:", -1 /* NSWindowBelow */, frame as isize); }
     true
 }
+/// Another app's normal window lies between KiCad's frame (below) and our window (above): ordering ours below the frame would sink our
+/// window under that app's, which nobody asked for. Then only KiCad can put it right (it orders its frame just above ours).
+pub fn others_between(top: u64, frame: u64) -> bool {
+    if frame == 0 { return false }
+    let kicad = match owner(frame) { 0 => KICAD_PID.load(std::sync::atomic::Ordering::Relaxed), p => p };
+    for e in list(ON_SCREEN_ABOVE | EXCLUDE_DESKTOP, frame).into_iter().rev().filter(|e| e.2 == 0) {
+        if e.0 == top { return false }
+        if e.1 != kicad && e.1 != own_pid() { return true }
+    }
+    false
+}
 /// Our window is the key window (it has our app's keyboard): a change of it comes with orders from both sides.
 pub fn host_key(top: u64) -> bool { unsafe { let w = ns_window(top); !w.is_null() && send_bool(w, c"isKeyWindow") } }
 
