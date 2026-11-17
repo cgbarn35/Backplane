@@ -97,14 +97,21 @@ else:
         return [(int(w['number']), int(w['pid']), w['owner'], tuple(round(v) for v in w['bounds'])) for w in helper('windows') or [] if w['layer'] == 0]
 
     # macOS virtual key codes the checks use, to the keysym names the relay types (Screen Sharing: Super is Command)
-    KEYNAME = {0: 'a', 40: 'k', 53: 'escape', 11: 'b', 38: 'j', 8: 'c', 48: 'tab', 51: 'backspace', 3: 'f', 43: ',', 13: 'w', 36: 'return', 117: 'delete'}
+    KEYNAME = {1: 's', 0: 'a', 40: 'k', 53: 'escape', 11: 'b', 38: 'j', 8: 'c', 48: 'tab', 51: 'backspace', 3: 'f', 43: ',', 13: 'w', 36: 'return', 117: 'delete'}
 
     def key(code, flags=0):
         mods = [m for m, bit in (('ctrl', CTRL), ('alt', ALT), ('shift', SHIFT), ('cmd', CMD)) if flags & bit]
         relay(op='chord', combo='+'.join(mods + [KEYNAME[code]]))
 
     def click(x, y, button='left'): relay(op='click', x=x, y=y, button=1 if button == 'left' else 3)
-    def shot_to(path): relay(op='png', path=path)
+    def shot_to(path):
+        # only the test's own windows (Backplane's and KiCad's), never the screen: their union's bounds
+        ours = [w for w in wins() if w[1] == client.pid or 'kicad' in w[2].lower() and OUT in ' '.join(subprocess.run(['ps', '-o', 'command=', '-p', str(w[1])], capture_output=True, text=True).stdout.split()[:1] or [''])]
+        ours = ours or [w for w in wins() if w[1] == client.pid]
+        if not ours: return
+        x0 = min(w[3][0] for w in ours); y0 = min(w[3][1] for w in ours)
+        x1 = max(w[3][0] + w[3][2] for w in ours); y1 = max(w[3][1] + w[3][3] for w in ours)
+        relay(op='png', path=path, rect=[x0, y0, x1 - x0, y1 - y0])
 
     # windows by hand, as a person moves them (the title bar's empty part left of the title, the bottom-right corner, the green and red
     # buttons: 13 pt below the top, at 14, 36 and 58 pt from the left on macOS 26)
@@ -165,6 +172,18 @@ if DRIVER == 'vnc' and os.environ.get('MAC_MODE') != 'libs':
     with open(os.path.join(OUT, 'bin/claude'), 'w') as f:
         f.write('#!/bin/sh\nexec /usr/bin/python3 ' + os.path.join(REPO, 'test/kicad_embed/mac/standin_agent.py') + ' "$@"\n')
     os.chmod(os.path.join(OUT, 'bin/claude'), 0o755)
+if os.environ.get('MAC_MODE') == 'autosave':
+    for v in ('10.99',):
+        kc = os.path.join(OUT, 'fh/Library/Preferences/kicad', v, 'kicad_common.json')
+        j = json.load(open(kc)) if os.path.isfile(kc) else {}
+        j.setdefault('system', {})['local_history_debounce'] = 3; j.setdefault('auto_backup', {})['enabled'] = True
+        os.makedirs(os.path.dirname(kc), exist_ok=True); json.dump(j, open(kc, 'w'))
+if os.environ.get('MAC_MODE') == 'lock':
+    # another live KiCad has the project open: a stand-in writes KiCad's lock JSON and holds its flock (lane B's embed_foreign_lock_e2e)
+    LCK = os.path.join(OUT, 'proj', '~ecc83-pp.kicad_pro.lck')
+    holder = subprocess.Popen([sys.executable, '-c', 'import fcntl,json,sys,time\nf=open(sys.argv[1],"w");json.dump({"hostname":sys.argv[2],"username":sys.argv[3],"token":"other"},f);f.flush()\nfcntl.flock(f.fileno(),fcntl.LOCK_EX)\ntime.sleep(3600)',
+                               LCK, os.uname().nodename.split('.')[0], os.environ.get('USER', 'h')])
+    procs.append(holder); time.sleep(1)
 if os.environ.get('MAC_MODE') == 'update':
     # the starting state: bp.12.5 installed by the hub's installer (placed where it puts it; an APFS clone of the published runtime)
     _ver = json.load(open(os.path.join(RT, 'manifest.json')))['version']
@@ -353,6 +372,11 @@ try:
         RES['docs_prompt'] = pr and {'owner': pr['owner'], 'bounds': pr['bounds']}
         shot('docs-1-prompt')
         check(bool(pr), f'docs: a project in ~/Documents makes macOS ask for Backplane ({RES["docs_prompt"]})')
+        if not pr:
+            ws = helper('windows') or []
+            print('INFO docs: no prompt; on screen: ' + json.dumps(sorted({(w['owner'], w['layer']) for w in ws})), flush=True)
+            hl = [l for l in hub_log().splitlines() if 'Documents' in l or 'Operation not permitted' in l or 'denied' in l.lower()]
+            print('INFO docs: hub lines about it: ' + json.dumps(hl[:5]), flush=True)
         if pr:
             time.sleep(12)  # past the hub's 5 s "not ready" and its old 30 s restart point would come later: the message is said meanwhile
             said = 'mac-permission-prompt' in client_log() or 'macOS is asking for permission' in client_log()
@@ -375,6 +399,44 @@ try:
                 stuck = '"state":"starting"' in last and 'mac-permission-prompt' not in last
                 check(not stuck, f'docs: Don\'t Allow: the pane says what to do rather than hanging on "Starting KiCad…" ({last[:200]})')
                 print('INFO docs deny: the pane as shown in docs-4-denied.png', flush=True)
+        raise SystemExit(1 if FAILS else 0)
+    if os.environ.get('MAC_MODE') == 'lock':
+        def rect_since(i, line):
+            r = None
+            for l in client_log().splitlines()[line:]:
+                if 'GPUI_METRIC ' in l and '"rects"' in l:
+                    try:
+                        for e in json.loads(l.split('GPUI_METRIC ', 1)[1]).get('rects', []) or []:
+                            if isinstance(e, dict) and e.get('id') == i: r = e
+                    except Exception: pass
+            k = backing_scale()
+            return r and dict(r, x=r['x'] / k, y=r['y'] / k, w=r['w'] / k, h=r['h'] / k)
+        def press(r):
+            b = next((w for w in wins() if w[0] == cw[0]), cw)[3]; click(b[0] + r['x'] + r['w'] / 2, b[1] + 28 + r['y'] + r['h'] / 2)
+        def kicads():
+            out = []
+            for l in subprocess.run(['ps', '-axo', 'pid=,command='], capture_output=True, text=True).stdout.splitlines():
+                if '--parent-pid' in l and '--embedded' in l and OUT in l: out.append(l.split()[0])
+            return out
+        def kicad_frame():
+            order = wins(); ours = next((i for i, w in enumerate(order) if cw and w[0] == cw[0]), None)
+            if ours is None: return None
+            k = [w for w in order[:ours] if w[1] not in (client.pid, hub.pid) and 'kicad' in w[2].lower()]
+            return k[0] if k and order.index(k[0]) == ours - 1 else None
+        holders = lambda: subprocess.run(['lsof', '-t', '--', LCK], capture_output=True, text=True).stdout.split()
+        fow = lambda: 'File Open Warning' in hub_log()
+        o = wait_for(lambda: rect_since('kicad:lock-open', 0), 60, 0.5); c = rect_since('kicad:lock-cancel', 0); time.sleep(1); shot('lock-1-asked')
+        check(bool(o) and bool(c) and not kicads() and not fow(), f'lock L1: the pane asks Open anyway or Cancel; no KiCad started, no File Open Warning (KiCads {kicads()})')
+        mark = len(client_log().splitlines())
+        if c: press(c)
+        time.sleep(2.5); rt = wait_for(lambda: rect_since('kicad:retry', mark), 10, 0.5); shot('lock-2-cancelled')
+        check(not kicads() and bool(rt) and str(holder.pid) in holders(), f'lock L2: Cancel: no KiCad starts, Try again offered, the other KiCad still holds its lock ({holders()})')
+        mark = len(client_log().splitlines())
+        if rt: press(rt)
+        o2 = wait_for(lambda: rect_since('kicad:lock-open', mark), 30, 0.5)
+        if o2: press(o2)
+        f = wait_for(kicad_frame, 90, 0.5); shot('lock-3-opened')
+        check(bool(o2) and bool(f) and not fow(), f'lock L3: Try again asks again; Open anyway paints the editor, no File Open Warning (holders now {holders()})')
         raise SystemExit(1 if FAILS else 0)
     if os.environ.get('MAC_MODE') == 'update':
         row = wait_for(lambda: rects().get('kicad-update'), 120, 0.5)
@@ -425,6 +487,60 @@ try:
         p, k = last_push(), kicad_frame()
         check(bool(got), f'{tag}: KiCad\'s frame is the pane\'s rect within 1 px ({k and k[3]} vs {p and p[0]})')
     matches('at first show')
+    # ---- MAC_MODE=autosave: with the keyboard in Backplane (KiCad not the active app), an agent commits a change over the API; a .history
+    # snapshot appears within the debounce (3 s here); KiCad killed; Open the editor again: KiCad offers the recovery, and the pane names it ----
+    if os.environ.get('MAC_MODE') == 'autosave':
+        sys.path.insert(0, os.path.join(REPO, 'test/kicad_embed/mac')); import hub_ws
+        token = open(os.path.join(OUT, 'home/token')).read().strip(); pcb = os.path.join(OUT, 'proj', 'ecc83-pp.kicad_pcb')
+        def mcalls(): return [l for l in open(os.path.join(OUT, 'standin.log'), errors='replace').read().splitlines() if l.startswith('MCPCALL')] if os.path.isfile(os.path.join(OUT, 'standin.log')) else []
+        def ask(name, args, wait=120):
+            n0 = len(mcalls())
+            hub_ws.send(port, token, 'turn.start', {'thread': 't1', 'text': 'mcpcall:' + json.dumps({'name': name, 'arguments': args}), 'msg': f'as-{time.time_ns()}'})
+            wait_for(lambda: len(mcalls()) > n0, wait, 0.3)
+            l = mcalls()[-1] if len(mcalls()) > n0 else ''
+            try: return json.loads(json.loads(l.split(' ', 2)[2])['result']['content'][0]['text'])
+            except Exception: return {'raw': l[:300]}
+        hist = os.path.join(OUT, 'proj', '.history')
+        snaps = lambda: int(subprocess.run(['git', '-C', hist, 'rev-list', '--all', '--count'], capture_output=True, text=True).stdout.strip() or 0) if os.path.isdir(hist) else 0
+        # the keyboard to Backplane: a click in its chrome
+        cwa = next((w for w in wins() if w[0] == cw[0]), cw)
+        click(cwa[3][0] + 200, cwa[3][1] + 28 + 300); time.sleep(1)
+        check(not active(kpid), 'autosave: the keyboard is in Backplane (KiCad is not the active app)')
+        C = 'kiapi.common.commands.'
+        docs = ask('kicad_ipc', {'path': pcb, 'type': C + 'GetOpenDocuments', 'message': {'type': 'DOCTYPE_PCB'}})
+        doc = ((docs.get('message') or {}).get('documents') or [None])[0]
+        h = {'document': doc}
+        s0 = snaps()
+        b = ask('kicad_ipc', {'path': pcb, 'type': C + 'BeginCommit', 'save': False, 'message': {'header': h}})
+        tid = (b.get('message') or {}).get('id')
+        ask('kicad_ipc', {'path': pcb, 'type': C + 'CreateItems', 'save': False, 'message': {'header': h, 'items': [{'@type': 'type.googleapis.com/kiapi.board.types.Track', 'id': {'value': str(__import__('uuid').uuid4())},
+            'start': {'x_nm': 120000000, 'y_nm': 100000000}, 'end': {'x_nm': 140000000, 'y_nm': 100000000}, 'width': {'value_nm': 300000}, 'layer': 'BL_F_Cu'}]}})
+        # save: false (lane J's 5c3cddabc saves an agent's landed change by default): the change stays unsaved, as the recovery needs
+        e = ask('kicad_ipc', {'path': pcb, 'type': C + 'EndCommit', 'save': False, 'message': {'header': h, 'id': tid, 'action': 'CMA_COMMIT', 'message': 'agent add track'}})
+        RES['autosave_commit'] = {'doc': bool(doc), 'tid': bool(tid), 'end': str(e)[:160]}
+        got = wait_for(lambda: snaps() > s0, 3 + 12, 0.5)
+        check(bool(got), f'autosave: a .history snapshot within the debounce after the agent\'s commit ({s0} -> {snaps()}; {RES["autosave_commit"]})')
+        # KiCad killed; Open the editor again; KiCad offers the recovery
+        kk = []
+        for l in subprocess.run(['ps', '-axo', 'pid=,command='], capture_output=True, text=True).stdout.splitlines():
+            if '--parent-pid' in l and '--embedded' in l and OUT in l: kk.append(int(l.split()[0]))
+        for p in kk:
+            try: os.kill(p, 9)
+            except OSError: pass
+        oa = wait_for(lambda: rects().get('kicad:open-again'), 20, 0.5); shot('autosave-1-closed')
+        if oa:
+            b2 = next((w for w in wins() if w[0] == cw[0]), cw)[3]; click(b2[0] + oa['x'] + oa['w'] / 2, b2[1] + 28 + oa['y'] + oa['h'] / 2)
+        # macOS: KiCad's recovery question is a native alert before its API is up (no dialog event): a window of KiCad's own on screen
+        # while it is not ready, or (where the fork reports it) the dialog event
+        def alert():
+            ks = [w for w in wins() if 'kicad' in w[2].lower() and w[1] not in (client.pid, hub.pid) and w[3][2] < 600 and w[3][3] < 600]
+            return ks or ('Recover Unsaved Changes' in hub_log())
+        rec = wait_for(alert, 90, 0.5); time.sleep(2); shot('autosave-2-recovery')
+        named = 'kicad-recover-prompt' in client_log() or 'kicad-recover-prompt' in hub_log() or 'Recover Unsaved Changes' in client_log()
+        RES['autosave_alert'] = str(rec)[:160]
+        check(bool(oa) and bool(rec), f'autosave: KiCad killed, Open the editor again: KiCad offers Recover Unsaved Changes (open-again {bool(oa)})')
+        check(named, 'autosave: the pane names it ("KiCad is asking: Recover Unsaved Changes")')
+        raise SystemExit(1 if FAILS else 0)
     # ---- MAC_MODE=first: a fresh home's first Edit puts KiCad over the pane within 30 s (the checks above), and stops ----
     if os.environ.get('MAC_MODE') == 'first':
         check(RES['edit_to_frame_s'] <= 30, f'first Edit on a fresh home: KiCad over the pane within 30 s ({RES["edit_to_frame_s"]} s)')
@@ -503,19 +619,312 @@ try:
     if os.environ.get('MAC_MODE') == 'bs':
         K_X, K_Z = 7, 6
         KEYNAME.update({7: 'x', 6: 'z'}) if DRIVER == 'vnc' else None
-        edits = lambda: hub_log().count('ET_DOCUMENT_EDITED') + hub_log().count('ET_MODIFIED_CHANGED')
+        def evs():
+            out = []
+            for ln in hub_log().splitlines():
+                i = ln.find('kicad embed event: ')
+                if i < 0: continue
+                try: out.append(json.loads(ln[i + 19:]))
+                except ValueError: pass
+            return out
+        seq = lambda: max((int(e.get('seq', 0)) for e in evs()), default=0)
+        def edits_since(n, frame=None):  # KiCad's own edit events after seq n: (created, deleted) counts each
+            r = []
+            for e in evs():
+                if int(e.get('seq', 0)) > n and e.get('type') == 'ET_DOCUMENT_EDITED':
+                    try: d = json.loads(e.get('detail') or '{}')
+                    except ValueError: d = {}
+                    r.append((len(d.get('created') or []), len(d.get('deleted') or [])))
+            return r
+        def checks_idle(n, t=20):  # the checks KiCad runs after an edit have reported (ET_CHECKS_DONE after seq n)
+            return wait_for(lambda: any(int(e.get('seq', 0)) > n and e.get('type') == 'ET_CHECKS_DONE' for e in evs()), t)
+        def sel_refs():
+            for e in reversed(evs()):
+                if e.get('type') == 'ET_SELECTION_CHANGED': return (e.get('selection') or {}).get('references') or []
+            return []
         def board_click(fx=0.5, fy=0.5):
             p = last_push(); click(p[0][0] + p[0][2] * fx, p[0][1] + p[0][3] * fy); time.sleep(0.6)
         def deleted(after, tag):
-            e0 = edits(); after()
-            ok = bool(wait_for(lambda: edits() > e0, 3)); shot(f'bs-{tag}')
-            key(K_Z, CMD); time.sleep(1.2)  # undo: the next case starts from the same board
+            n = seq(); after()
+            ok = bool(wait_for(lambda: any(d for c, d in edits_since(n)), 4)); shot(f'bs-{tag}')
+            if ok:  # undo once KiCad's checks are done: the next case starts from the same board
+                checks_idle(n); m = seq(); key(K_Z, CMD); wait_for(lambda: any(c for c, d in edits_since(m)), 4); checks_idle(m)
             return ok
-        trace = lambda: open(os.path.join(OUT, 'kicad-embed-trace.log'), errors='replace').read().count('Backspace handed to wx') if os.path.isfile(os.path.join(OUT, 'kicad-embed-trace.log')) else 0
+        if os.environ.get('BS_PROBE') == 'undo':  # which delete path leaves Cmd+Z working: fn+delete, ⌫, ⌫ then Cmd+S
+            def try_undo(tag):
+                m = seq(); key(K_Z, CMD); u = bool(wait_for(lambda: any(c for c, d in edits_since(m)), 4)); checks_idle(m, 8)
+                print(f'INFO probe {tag}: Cmd+Z {"undoes" if u else "does nothing"}', flush=True); return u
+            for tag, k in (('fn+delete', K_FDEL), ('⌫', K_DEL), ('fn+delete again', K_FDEL)):
+                key(K_ESC); time.sleep(0.3); board_click(0.1, 0.9); n = seq(); key(K_A, CMD); time.sleep(0.6); key(k)
+                d = bool(wait_for(lambda: any(d for c, d in edits_since(n)), 4)); checks_idle(n, 8)
+                print(f'INFO probe {tag}: delete {"lands" if d else "does nothing"}', flush=True)
+                if d and not try_undo(tag):
+                    board_click(0.1, 0.9); try_undo(tag + ', after a click')
+                    if not try_undo(tag + ', again'):
+                        key(1, CMD); time.sleep(2); try_undo(tag + ', after Cmd+S')
+            raise SystemExit(0)
+        if os.environ.get('BS_PROBE') == 'route':  # 3 and 4 judged without pixels where it can be: tracks counted from KiCad's edit events
+            def pt(fx, fy):
+                p = last_push(); return p[0][0] + p[0][2] * fx, p[0][1] + p[0][3] * fy
+            def route(y, back):
+                # p1 → p2 across, p2 → p3 down: one track each. Without ⌫, finish at p3 (2 tracks). With ⌫ after p3, finish where the
+                # route then ends, p2: 1 track if ⌫ took the last segment back, 2 or more if it did not
+                key(K_ESC); time.sleep(0.3); key(K_ESC); time.sleep(0.3); key(K_X); time.sleep(0.8)
+                n = seq(); p1, p2, p3 = pt(0.22, y), pt(0.36, y), pt(0.36, y + 0.08)
+                for q in (p1, p2, p3): click(*q); time.sleep(0.7)
+                end = p3
+                if back:
+                    relay(op='move', x=p3[0] + 30, y=p3[1] + 25); time.sleep(0.8); shot('bs-route-before')
+                    key(K_DEL); time.sleep(0.8); shot('bs-route-after'); end = p2
+                relay(op='move', x=end[0], y=end[1]); time.sleep(0.5); click(*end); click(*end); time.sleep(1.5)
+                created = sum(c for c, d in edits_since(n)); key(K_ESC); time.sleep(0.3); key(K_ESC); time.sleep(0.6)
+                return created
+            board_click(0.1, 0.9)
+            t0 = open(os.path.join(OUT, 'kicad-embed-trace.log'), errors='replace').read().count('Backspace handed')
+            a = route(0.56, False); b = route(0.70, True)
+            t1 = open(os.path.join(OUT, 'kicad-embed-trace.log'), errors='replace').read().count('Backspace handed')
+            print(f'INFO bs 3: without ⌫ the route committed {a} tracks; with ⌫ and finished where it then ends, {b} (⌫ handed to wx {t1 - t0} times)', flush=True)
+            check(a >= 2 and b == 1, 'bs 3: ⌫ while routing takes back the last segment (1 track committed, not 2)')
+            # 4: Find's field: a, b, c as key presses, then ⌫; the field's text in a picture of Backplane's window only
+            board_click(0.1, 0.9); key(K_F, CMD); time.sleep(1.5)
+            for k in (0, 11, 8): key(k); time.sleep(0.15)
+            shot('bs-text-before'); key(K_DEL); time.sleep(0.6); shot('bs-text-field'); key(K_ESC); time.sleep(1.0)
+            print('INFO bs 4: Find\'s field in bs-text-before.png ("abc") and bs-text-field.png ("ab")', flush=True)
+            raise SystemExit(1 if FAILS else 0)
+        if os.environ.get('BS_PROBE') == 'focus':  # a click in Backplane takes the keyboard back from the embedded KiCad (the lead's item 5)
+            cwa = next((w for w in wins() if w[0] == cw[0]), cw)[3]
+            def home_has(text):
+                r = subprocess.run(['grep', '-rlF', text, os.path.join(OUT, 'home')], capture_output=True, text=True); return bool(r.stdout.strip())
+            for i, (where, at) in enumerate((('the chat box', (cwa[0] + 230, cwa[1] + 620)), ('the chat box after Cmd+A on the board', (cwa[0] + 230, cwa[1] + 620)))):
+                board_click(0.1, 0.9); time.sleep(0.5)
+                if i == 1: key(K_A, CMD); time.sleep(0.6)
+                k_active = active(kpid)
+                n = seq(); click(*at); time.sleep(1.0)
+                after_active = active(kpid)
+                mark = f'lanemfocus{i}{int(time.time()) % 100000}'
+                relay(op='text', text=mark); time.sleep(0.5); key(36); time.sleep(3)
+                in_bp = home_has(mark)
+                k_ev = sorted({e.get('type') for e in evs() if int(e.get('seq', 0)) > n} - {'ET_PROGRESS', 'ET_FRAME_DRAWN', 'ET_CHECKS_DONE'})
+                c, d = (sum(x) for x in zip(*edits_since(n))) if edits_since(n) else (0, 0)
+                print(f'INFO focus {i}: KiCad active before the click {k_active}, after {after_active}; KiCad events after the click {k_ev}; edits created {c} deleted {d}', flush=True)
+                check(in_bp and not (c or d), f'focus: after a click in {where}, typing goes to Backplane (the message "{mark}" is in the thread{"" if in_bp else ": NOT found"}; KiCad edits {c + d})')
+            raise SystemExit(1 if FAILS else 0)
+        if os.environ.get('BS_PROBE') == 'keys':  # climb-j's edit-keys table (lib/edit_keys_table.json), same row ids, plus extra_* menu chords
+            KEYNAME.update({6: 'z', 7: 'x', 9: 'v', 16: 'y', 35: 'p', 31: 'o', 12: 'q', 5: 'g', 24: '=', 27: '-'})
+            K_Z, K_X, K_V, K_Y, K_S = 6, 7, 9, 16, 1
+            W = 4
+            sys.path.insert(0, os.path.join(REPO, 'test/kicad_embed/mac')); import hub_ws
+            token = open(os.path.join(OUT, 'home/token')).read().strip(); pcbf = os.path.join(OUT, 'proj', 'ecc83-pp.kicad_pcb'); schf = os.path.join(OUT, 'proj', 'ecc83-pp.kicad_sch')
+            tr = lambda: open(os.path.join(OUT, 'kicad-embed-trace.log'), errors='replace').read().splitlines() if os.path.isfile(os.path.join(OUT, 'kicad-embed-trace.log')) else []
+            def since(n, typ): return [e for e in evs() if int(e.get('seq', 0)) > n and e.get('type') == typ]
+            def press(code, flags=0):  # (seq before, trace lines before)
+                n, t = seq(), len(tr()); key(code, flags); return n, t
+            def ed(n): r = edits_since(n); return sum(c for c, d in r), sum(d for c, d in r)
+            def wait_ed(n, want):  # want: 'c' or 'd'
+                wait_for(lambda: (ed(n)[0] if want == 'c' else ed(n)[1]) > 0, W); time.sleep(0.4); return ed(n)
+            ROWS = []
+            def row(ed_, rid, verdict, detail, t0=None):
+                tl = [l.split('macos: ', 1)[-1] for l in tr()[t0:]] if t0 is not None else []
+                tl = [l for l in tl if 'handed to wx' in l][-2:]
+                ROWS.append((ed_, rid, verdict, detail)); line = f'ROW {ed_} {rid}: {verdict} ({detail}){"; trace: " + " | ".join(tl) if tl else ""}'
+                gating = not rid.startswith('extra_')
+                if gating: check(verdict == 'works', line)
+                else: print('INFO ' + line, flush=True)
+            def settle(n): checks_idle(n, 6); time.sleep(0.3)
+            def canvas(): key(K_ESC); time.sleep(0.3); board_click(0.1, 0.9); time.sleep(0.3)
+            def judge_cd(n, want, wrong):  # an edit of the wanted kind, or the opposite
+                c, d = wait_ed(n, want)
+                good = c if want == 'c' else d; bad = d if want == 'c' else c
+                if good and not (wrong and bad): return 'works', f'created {c}, deleted {d}'
+                if c or d: return 'wrong', f'created {c}, deleted {d}'
+                return 'nothing', 'no edit event'
+            def table(E, f):
+                canvas()
+                n, t = press(K_A, CMD); wait_for(lambda: since(n, 'ET_SELECTION_CHANGED'), W); time.sleep(0.4)
+                sel = [e.get('selection') or {} for e in since(n, 'ET_SELECTION_CHANGED')]
+                many = any(len(x.get('references') or []) + len(x.get('nets') or []) > 1 or x.get('count', 0) > 1 for x in sel)
+                row(E, 'select_all', 'works' if many else ('wrong' if sel else 'nothing'), f'{len(sel)} selection events; last {str(sel[-1])[:90] if sel else "-"}', t)
+                n, t = press(K_FDEL); v = judge_cd(n, 'd', True); row(E, 'delete', *v, t); settle(n)
+                n, t = press(K_Z, CMD); v = judge_cd(n, 'c', True); row(E, 'undo', *v, t); settle(n); undo_ok = v[0] == 'works'
+                n, t = press(K_Y, CMD); v = judge_cd(n, 'd', True); row(E, 'redo', *v, t); settle(n)
+                if v[0] == 'works': m = seq(); key(K_Z, CMD); wait_ed(m, 'c'); settle(m)
+                n, t = press(K_Z, CMD | SHIFT); v = judge_cd(n, 'd', True); row(E, 'redo_shift_z', *v, t); settle(n)
+                if v[0] == 'works': m = seq(); key(K_Z, CMD); wait_ed(m, 'c'); settle(m)
+                # undo and redo every time: 10 of 10 each (the earlier 6-of-7 failures must not recur)
+                canvas(); key(K_A, CMD); time.sleep(0.5); m = seq(); key(K_FDEL); wait_ed(m, 'd'); settle(m)
+                nu = nr = 0
+                for _ in range(10):
+                    m = seq(); key(K_Z, CMD); c, d = wait_ed(m, 'c'); nu += bool(c and not d); settle(m)
+                    m = seq(); key(K_Z, CMD | SHIFT); c, d = wait_ed(m, 'd'); nr += bool(d and not c); settle(m)
+                m = seq(); key(K_Z, CMD); wait_ed(m, 'c'); settle(m)
+                row(E, 'undo_10', 'works' if nu == 10 else ('nothing' if nu == 0 else 'wrong'), f'Cmd+Z undid {nu} of 10')
+                row(E, 'redo_10', 'works' if nr == 10 else ('nothing' if nr == 0 else 'wrong'), f'Cmd+Shift+Z redid {nr} of 10')
+                if not undo_ok:
+                    print(f'INFO {E}: undo is nothing, so the rows after it run on what is left (no restore): judge them with that in mind', flush=True)
+                canvas(); key(K_A, CMD); time.sleep(0.5)
+                n, t = press(K_DEL); v = judge_cd(n, 'd', True); row(E, 'backspace', *v, t); settle(n)
+                if v[0] == 'works' and undo_ok: m = seq(); key(K_Z, CMD); wait_ed(m, 'c'); settle(m)
+                canvas(); key(K_A, CMD); time.sleep(0.5)
+                subprocess.run(['pbcopy'], input=b'lane-m-before-copy'); key(8, CMD); time.sleep(0.8)
+                pb = subprocess.run(['pbpaste'], capture_output=True).stdout.decode(errors='replace')
+                pb_kicad = pb != 'lane-m-before-copy' and ('(footprint' in pb or '(symbol' in pb or '(kicad_' in pb or '(segment' in pb or 'lib_symbols' in pb)
+                print(f'INFO {E} copy: after Cmd+C the pasteboard {"holds KiCad text" if pb_kicad else ("is unchanged" if pb == "lane-m-before-copy" else "changed but not to KiCad text")} ({len(pb)} chars: {pb[:60]!r})', flush=True)
+                key(K_ESC); time.sleep(0.4)
+                p = last_push(); relay(op='move', x=p[0][0] + p[0][2] * 0.5, y=p[0][1] + p[0][3] * 0.5); time.sleep(0.4)
+                n, t = press(K_V, CMD); time.sleep(1.0); board_click(0.5, 0.5); v = judge_cd(n, 'c', True); row(E, 'copy_paste', *v, t); settle(n)
+                if v[0] == 'works' and undo_ok: m = seq(); key(K_Z, CMD); wait_ed(m, 'd'); settle(m)
+                canvas(); key(K_A, CMD); time.sleep(0.5)
+                n, t = press(K_X, CMD); v = judge_cd(n, 'd', True); row(E, 'cut', *v, t); settle(n)
+                p = last_push(); relay(op='move', x=p[0][0] + p[0][2] * 0.5, y=p[0][1] + p[0][3] * 0.5); time.sleep(0.4)
+                n, t = press(K_V, CMD); time.sleep(1.0); board_click(0.5, 0.5); v = judge_cd(n, 'c', True); row(E, 'cut_paste', *v, t); settle(n)
+                key(K_ESC); time.sleep(0.3)
+                m0, b0 = os.path.getmtime(f), open(f, 'rb').read()
+                n, t = press(K_S, CMD); saved = wait_for(lambda: os.path.getmtime(f) > m0, 6)
+                row(E, 'save', 'works' if saved and open(f, 'rb').read() != b0 else ('wrong' if saved else 'nothing'), 'the file changed' if saved else 'the file unchanged', t)
+                canvas(); n, t = press(K_F, CMD); wait_for(lambda: since(n, 'ET_DIALOG_OPENED'), W)
+                dl = [e.get('detail') for e in since(n, 'ET_DIALOG_OPENED')]
+                row(E, 'find', 'works' if 'Find' in dl else ('wrong' if dl else 'nothing'), f'dialogs {dl}', t); key(K_ESC); time.sleep(1.0)
+                # the other menu chords: what they open or do (not gating; the trace says whether wx took them)
+                for name, code, fl, close in (('extra_print', 35, CMD, True), ('extra_preferences', 43, CMD, True), ('extra_open', 31, CMD, True),
+                                              ('extra_search_panel', 5, CMD, False), ('extra_zoom_in', 24, CMD | SHIFT, False), ('extra_zoom_in_plain', 24, CMD, False), ('extra_zoom_out', 27, CMD, False)):
+                    canvas(); n, t = press(code, fl); time.sleep(2.0)
+                    dl = [e.get('detail') for e in since(n, 'ET_DIALOG_OPENED')]; c, d = ed(n)
+                    other = sorted({e.get('type') for e in evs() if int(e.get('seq', 0)) > n} - {'ET_PROGRESS', 'ET_FRAME_DRAWN', 'ET_CHECKS_DONE', 'ET_FOCUS_IN', 'ET_FOCUS_OUT'})
+                    alive = bool(kicad_frame())
+                    row(E, name, 'opened ' + ', '.join(map(str, dl)) if dl else ('edit' if c or d else 'no dialog, no edit'), f'events {other}; KiCad frame {"there" if alive else "GONE"}', t)
+                    if dl and close:
+                        m = seq(); key(K_ESC); closed = wait_for(lambda: since(m, 'ET_DIALOG_CLOSED'), W)
+                        print(f'INFO ROW {E} {name}: Escape {"closes it" if closed else "does NOT close it"}', flush=True)
+                        if not closed: key(K_ESC); time.sleep(1.0)
+                    if not alive: print(f'INFO {E}: KiCad frame gone after {name}; the table stops here', flush=True); return False
+                if E == 'sch':  # last: Cmd+W (KiCad's Close: the pane goes back to View, Edit brings a fresh frame), then Cmd+Q (nothing or the save gate)
+                    canvas(); n, t = press(13, CMD)
+                    gone = wait_for(lambda: not kicad_frame(), 10); offered = wait_for(lambda: rects().get('ui:Edit'), 10)
+                    back = None
+                    if offered:
+                        r = rects().get('ui:Edit'); b = next((w for w in wins() if w[0] == cw[0]), cw)[3]
+                        click(b[0] + r['x'] + r['w'] / 2, b[1] + 28 + r['y'] + r['h'] / 2); back = wait_for(kicad_frame, 60, 0.5)
+                    dl = [e.get('detail') for e in since(n, 'ET_DIALOG_OPENED')]
+                    row(E, 'extra_close_window', 'works' if gone and offered and back else 'wrong', f'frame gone {bool(gone)}; the pane offers Edit {bool(offered)}; Edit brings it back {bool(back)}; dialogs {dl}', t)
+                    if back:
+                        time.sleep(4); board_click(0.1, 0.9); kp = {w[1] for w in wins() if 'kicad' in w[2].lower()}
+                        n, t = press(12, CMD); time.sleep(3)
+                        dl = [e.get('detail') for e in since(n, 'ET_DIALOG_OPENED')]; alive = bool(kicad_frame())
+                        v = 'nothing (KiCad stays)' if alive and not dl else (f'the save gate ({dl})' if alive else 'KiCad QUIT')
+                        row(E, 'extra_quit', v, f'frame there {alive}; dialogs {dl}', t)
+                        if dl: key(K_ESC); time.sleep(1.0)
+                return True
+            # ⌫ while routing, inside the board: pictures of KiCad's frame only, right before and after ⌫
+            def kshot(tag):
+                k = kicad_frame()
+                if k: relay(op='png', rect=list(k[3]), path=os.path.join(OUT, tag + '.png'))
+            key(K_ESC); time.sleep(0.3); board_click(0.1, 0.9); key(K_ESC); time.sleep(0.3); key(K_X); time.sleep(0.8)
+            q = [(0.30, 0.42), (0.55, 0.42), (0.55, 0.62)]
+            for fx, fy in q: board_click(fx, fy); time.sleep(0.3)
+            pp = last_push(); relay(op='move', x=pp[0][0] + pp[0][2] * 0.62, y=pp[0][1] + pp[0][3] * 0.66); time.sleep(0.8)
+            t0 = len(tr()); kshot('bs-route-before'); key(K_DEL); time.sleep(1.0); kshot('bs-route-after')
+            print(f'INFO bs 3: ⌫ while routing, pictures bs-route-before.png / bs-route-after.png of KiCad\'s frame; trace {[l.split("macos: ",1)[-1] for l in tr()[t0:]]}', flush=True)
+            key(K_ESC); time.sleep(0.4); key(K_ESC); time.sleep(0.6)
+            board_click(0.1, 0.9)
+            go = table('pcb', pcbf)
+            if go:  # per_actor_undo (PCB): the person deletes everything, an agent's track lands (save: false), the person's Cmd+Z
+                port_ = port
+                def mcalls(): return [l for l in open(os.path.join(OUT, 'standin.log'), errors='replace').read().splitlines() if l.startswith('MCPCALL')] if os.path.isfile(os.path.join(OUT, 'standin.log')) else []
+                def ask(name, args, wait=60):
+                    n0 = len(mcalls())
+                    hub_ws.send(port_, token, 'turn.start', {'thread': 't1', 'text': 'mcpcall:' + json.dumps({'name': name, 'arguments': args}), 'msg': f'as-{time.time_ns()}'})
+                    wait_for(lambda: len(mcalls()) > n0, wait, 0.3)
+                    l = mcalls()[-1] if len(mcalls()) > n0 else ''
+                    try: return json.loads(json.loads(l.split(' ', 2)[2])['result']['content'][0]['text'])
+                    except Exception: return {'raw': l[:300]}
+                canvas(); key(K_A, CMD); time.sleep(0.5); n = seq(); key(K_FDEL); wait_ed(n, 'd'); settle(n)
+                C = 'kiapi.common.commands.'
+                docs = ask('kicad_ipc', {'path': pcbf, 'type': C + 'GetOpenDocuments', 'message': {'type': 'DOCTYPE_PCB'}})
+                h = {'document': ((docs.get('message') or {}).get('documents') or [None])[0]}
+                b = ask('kicad_ipc', {'path': pcbf, 'type': C + 'BeginCommit', 'save': False, 'message': {'header': h}}); tid = (b.get('message') or {}).get('id')
+                ask('kicad_ipc', {'path': pcbf, 'type': C + 'CreateItems', 'save': False, 'message': {'header': h, 'items': [{'@type': 'type.googleapis.com/kiapi.board.types.Track', 'id': {'value': str(__import__('uuid').uuid4())},
+                    'start': {'x_nm': 120000000, 'y_nm': 100000000}, 'end': {'x_nm': 140000000, 'y_nm': 100000000}, 'width': {'value_nm': 300000}, 'layer': 'BL_F_Cu'}]}})
+                ask('kicad_ipc', {'path': pcbf, 'type': C + 'EndCommit', 'save': False, 'message': {'header': h, 'id': tid, 'action': 'CMA_COMMIT', 'message': 'agent add track'}})
+                time.sleep(1.5); canvas()
+                n, t = press(K_Z, CMD); c, d = wait_ed(n, 'c'); settle(n)
+                m0 = os.path.getmtime(pcbf); key(K_S, CMD); wait_for(lambda: os.path.getmtime(pcbf) > m0, 6)
+                txt = open(pcbf, errors='replace').read(); has = '(start 120 100)' in txt and '(end 140 100)' in txt
+                v = 'works' if c > 0 and d == 0 and has else ('wrong' if d > 0 or not has else 'nothing')
+                row('pcb', 'per_actor_undo', v, f'created {c}, deleted {d}; the saved file {"has" if has else "lacks"} the agent\'s track; agent commit {"ok" if tid else "no id"}', t)
+            if go:
+                r = rects().get('kicad-tab:SCH'); b = next((w for w in wins() if w[0] == cw[0]), cw)[3]
+                if r: click(b[0] + r['x'] + r['w'] / 2, b[1] + 28 + r['y'] + r['h'] / 2)
+                time.sleep(6); board_click(0.1, 0.9); table('sch', schf)  # Cmd+W and Cmd+Q last, in the schematic: they may end the editor
+            RES['edit_keys'] = ROWS
+            raise SystemExit(1 if FAILS else 0)
+        if os.environ.get('BS_PROBE') == 'order':  # the ⌫ cases ordered so none needs Cmd+Z to restore the board (undo is lost on macOS)
+            K_DEL_ = K_DEL
+            # 3: ⌫ while routing takes back the last segment: judged in cropped pictures of KiCad's own frame
+            key(K_ESC); time.sleep(0.4); board_click(0.5, 0.5); key(K_ESC); time.sleep(0.4)
+            key(K_X); time.sleep(0.8); board_click(0.5, 0.35); board_click(0.65, 0.35); shot('bs-route-before'); key(K_DEL_); time.sleep(1.0); shot('bs-route-after')
+            key(K_ESC); time.sleep(0.4); key(K_ESC); time.sleep(0.6)
+            print('INFO bs 3: routing before/after ⌫ in bs-route-before.png and bs-route-after.png (judged by eye)', flush=True)
+            # 4: ⌫ in Find's field: "abc" then ⌫
+            board_click(0.1, 0.9); key(K_F, CMD); time.sleep(1.5)
+            relay(op='text', text='abc'); time.sleep(0.4); key(K_DEL_); time.sleep(0.6); shot('bs-text-field'); key(K_ESC); time.sleep(1.0)
+            print('INFO bs 4: Find\'s field after "abc" then ⌫ in bs-text-field.png (judged by eye: "ab")', flush=True)
+            # 2: the pointer on a point where a click selects exactly one footprint, the selection cleared, then ⌫
+            spot = None
+            for fx, fy in ((0.5, 0.5), (0.35, 0.5), (0.65, 0.5), (0.5, 0.35), (0.5, 0.65), (0.35, 0.35), (0.65, 0.65), (0.35, 0.65), (0.65, 0.35), (0.25, 0.5), (0.75, 0.5), (0.2, 0.3), (0.8, 0.7)):
+                key(K_ESC); time.sleep(0.4); board_click(fx, fy); time.sleep(0.4)
+                if len(sel_refs()) == 1: spot = (fx, fy, sel_refs()[0]); break
+            key(K_ESC); time.sleep(0.6)
+            if spot:
+                print(f'INFO bs 2: the pointer on {spot[2]} at ({spot[0]}, {spot[1]}) of the canvas, nothing selected', flush=True)
+                n = seq(); key(K_DEL_)
+                check(bool(wait_for(lambda: any(d for c, d in edits_since(n)), 4)), 'bs 2: ⌫ with nothing selected deletes the item under the pointer')
+            else:
+                check(False, 'bs 2: no point of the canvas selected exactly one footprint (the case could not be set up)')
+            # the schematic: Cmd+A then ⌫
+            r = rects().get('kicad-tab:SCH'); b = next((w for w in wins() if w[0] == cw[0]), cw)[3]
+            if r: click(b[0] + r['x'] + r['w'] / 2, b[1] + 28 + r['y'] + r['h'] / 2)
+            time.sleep(6); board_click(0.1, 0.9)
+            n = seq(); key(K_A, CMD); time.sleep(0.6); key(K_DEL_)
+            check(bool(wait_for(lambda: any(d for c, d in edits_since(n)), 4)), 'bs 1: Cmd+A then ⌫ deletes the selection in the embedded schematic editor')
+            print(f'INFO embed trace "Backspace handed to wx": {open(os.path.join(OUT, "kicad-embed-trace.log"), errors="replace").read().count("Backspace handed to wx")} times', flush=True)
+            raise SystemExit(1 if FAILS else 0)
+        trace = lambda:open(os.path.join(OUT, 'kicad-embed-trace.log'), errors='replace').read().count('Backspace handed to wx') if os.path.isfile(os.path.join(OUT, 'kicad-embed-trace.log')) else 0
+        # the menu chords (Edit > Undo, Redo, File > Save are menu key equivalents too, like Delete's ⌫): judged by KiCad's own edit events
+        # (created = undo of a delete, deleted = redo), never by modified-flag events, which trail the edit itself
         board_click(0.1, 0.9)
-        check(deleted(lambda: (key(K_A, CMD), time.sleep(0.6), key(K_DEL)), 'pcb-all'), 'bs 1: Cmd+A then ⌫ deletes the selection in the embedded board editor')
-        key(K_ESC); time.sleep(0.5); board_click(0.5, 0.5); key(K_ESC); time.sleep(0.6)
-        check(deleted(lambda: key(K_DEL), 'pcb-hover'), 'bs 2: ⌫ with nothing selected deletes the item under the pointer')
+        n0 = seq(); key(K_A, CMD); time.sleep(0.6); key(K_DEL)
+        d_ok = bool(wait_for(lambda: any(d for c, d in edits_since(n0)), 4))
+        check(d_ok, 'bs 1: Cmd+A then ⌫ deletes the selection in the embedded board editor')
+        # Cmd+Z at once after the delete (while KiCad's checks may still run), as a person would
+        n1 = seq(); key(K_Z, CMD)
+        u_fast = bool(wait_for(lambda: any(c for c, d in edits_since(n1)), 4))
+        check(u_fast, 'keys: Cmd+Z right after a delete undoes it (KiCad\'s checks still running)')
+        if not u_fast:
+            checks_idle(n0); n1 = seq(); key(K_Z, CMD)
+            u_late = bool(wait_for(lambda: any(c for c, d in edits_since(n1)), 4))
+            print(f'INFO keys: Cmd+Z once the checks are done: {"undoes" if u_late else "does nothing either"}', flush=True)
+        checks_idle(n1)
+        n2 = seq(); key(K_Z, CMD | SHIFT)
+        r_ok = bool(wait_for(lambda: any(d for c, d in edits_since(n2)), 4))
+        check(r_ok, 'keys: Cmd+Shift+Z redoes in the embedded board editor (the delete again)')
+        if r_ok:
+            checks_idle(n2); n3 = seq(); key(K_Z, CMD); wait_for(lambda: any(c for c, d in edits_since(n3)), 4); checks_idle(n3)
+        RES['bs_board_items_back'] = not edits_since(n0) or sum(c for c, d in edits_since(n0)) >= sum(d for c, d in edits_since(n0))
+        pcbf = os.path.join(OUT, 'proj', 'ecc83-pp.kicad_pcb'); m0 = os.path.getmtime(pcbf)
+        key(K_ESC); time.sleep(0.3); board_click(0.1, 0.9); time.sleep(0.4); key(1, CMD)  # Cmd+S (keycode 1 = s)
+        saved = wait_for(lambda: os.path.getmtime(pcbf) > m0, 6)
+        check(bool(saved), 'keys: Cmd+S saves the board in the embedded editor (the file on disk changes)')
+        # 2: find a point where a click selects exactly one footprint, clear the selection there, then ⌫ with the pointer still on it
+        spot = None
+        for fx, fy in ((0.5, 0.5), (0.35, 0.5), (0.65, 0.5), (0.5, 0.35), (0.5, 0.65), (0.35, 0.35), (0.65, 0.65), (0.35, 0.65), (0.65, 0.35), (0.25, 0.5), (0.75, 0.5)):
+            key(K_ESC); time.sleep(0.4); board_click(fx, fy); time.sleep(0.4)
+            if len(sel_refs()) == 1: spot = (fx, fy, sel_refs()[0]); break
+        key(K_ESC); time.sleep(0.6)
+        if spot:
+            print(f'INFO bs 2: the pointer on {spot[2]} at ({spot[0]}, {spot[1]}) of the canvas, nothing selected', flush=True)
+            check(deleted(lambda: key(K_DEL), 'pcb-hover'), 'bs 2: ⌫ with nothing selected deletes the item under the pointer')
+        else:
+            check(False, 'bs 2: no point of the canvas selected exactly one footprint (the case could not be set up)')
         board_click(0.1, 0.9)
         check(deleted(lambda: (key(K_A, CMD), time.sleep(0.6), key(K_FDEL)), 'pcb-fdel'), 'bs 5: fn+delete still deletes')
         # 3: routing from a pad (the board's middle has U1's pads), two clicks, then ⌫ takes back the last segment
@@ -543,7 +952,13 @@ try:
         from canvas_box import canvas_box
         def frame_canvas(tag):
             k = kicad_frame()
-            if not k: return None
+            if not k:  # not directly above Backplane's window: say what is between (owner names only), and measure KiCad's frame by its pid
+                order = wins(); ours = next((i for i, w in enumerate(order) if w[0] == cw[0]), len(order))
+                between = [w[2] for w in order[:ours] if w[1] != kpid]
+                k = next((w for w in order if w[1] == kpid and w[3][2] > 200), None)
+                print(f'INFO narrow {tag}: KiCad\'s frame is not directly above Backplane\'s window; above it: {between}; measured by its pid ({bool(k)})', flush=True)
+                print(f'INFO narrow {tag}: windows (number, pid, bounds), front first: {[(w[0], "client" if w[1] == client.pid else "kicad" if w[1] == kpid else "other", w[3]) for w in order if w[1] in (client.pid, kpid)]}; Backplane\'s was {cw[0]}; the last push {last_push()}', flush=True)
+                if not k: return None
             path = os.path.join(OUT, f'crop-{tag}.rgb')
             relay(op='crop', x=k[3][0], y=k[3][1], w=k[3][2], h=k[3][3], path=path)
             raw = open(path, 'rb').read(); nl = raw.index(b'\n'); w, h = map(int, raw[:nl].split())
@@ -562,22 +977,26 @@ try:
                 if abs(p[0][2] - target) <= 3: break
                 if prev and b[2] != prev[0] and p[0][2] != prev[1]: slope = max(0.2, min(2.0, (p[0][2] - prev[1]) / (b[2] - prev[0])))
                 prev = (b[2], p[0][2])
-                win_size(client.pid, max(500, min(1900, round(b[2] + (target - p[0][2]) / slope))), b[3]); time.sleep(2.0)
+                ww = max(500, min(1900, round(b[2] + (target - p[0][2]) / slope))); mark(f'window width {ww}'); win_size(client.pid, ww, b[3]); time.sleep(2.0)
             p = last_push()
             if p and p[0][2] < target - 3 and not folded[0]:
                 # wider than the window allows with the sidebar open (a 1000 pt pane on a 1920 pt display): fold it (Cmd+B in Backplane)
                 b = next((w for w in wins() if w[0] == cw[0]), cw)[3]
-                click(b[0] + 20, b[1] + b[3] - 40); time.sleep(0.6); key(K_B, CMD); time.sleep(2.0); folded[0] = True
+                mark('fold: click in the sidebar'); click(b[0] + 20, b[1] + b[3] - 40); time.sleep(0.6); mark('fold: Cmd+B'); key(K_B, CMD); time.sleep(2.0); folded[0] = True
                 return set_pane(target)
             time.sleep(3.0)  # the panels follow the width (EmbedAutoPanels)
             return last_push()[0][2] if last_push() else None
+        TR0 = [time.time()]
+        if os.environ.get('ZTRACE'):
+            helper(f'trace {client.pid} {kpid} {os.path.join(OUT, "ztrace.txt")} 400'); TR0[0] = time.time()
+        mark = lambda what: print(f'INFO ztrace {round((time.time() - TR0[0]) * 1000)} ms: {what}', flush=True)
         for tab in ('PCB', 'SCH'):
             if tab == 'SCH':
                 r = rects().get('kicad-tab:SCH'); b = next((w for w in wins() if w[0] == cw[0]), cw)[3]
                 if r: click(b[0] + r['x'] + r['w'] / 2, b[1] + 28 + r['y'] + r['h'] / 2)
                 wait_for(lambda: (k := kicad_frame()) and k, 60, 0.5); time.sleep(5)
             for target in (611, 480, 1000):
-                got = set_pane(target); m = frame_canvas(f'{tab}-{target}'); RES[f'narrow_{tab}_{target}'] = {'pane': got, **(m or {})}
+                mark(f'{tab} set_pane {target}'); got = set_pane(target); mark(f'{tab} measure {target} (pane {got})'); m = frame_canvas(f'{tab}-{target}'); RES[f'narrow_{tab}_{target}'] = {'pane': got, **(m or {})}
                 check(bool(m) and not m['whole_frame'] and m['share'] >= 0.6 and got and abs(got - target) <= 6,
                       f'narrow: {tab} in a {target} px pane ({got}): the canvas has at least 60 % of it ({m})')
             # Full size: the pane takes the room, and the panels come back
