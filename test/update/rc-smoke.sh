@@ -6,7 +6,7 @@
 # the helpers there and answering (voice, step2glb on a real STEP, the browser helper); the installed client started against the hub with the
 # Browser tab open on a local page: it draws (Linux: the embedded Chromium paints the page; macOS and Windows: no CEF, the helper's frames),
 # and no asset is missing ("icon X not in icons.json"). Update and rollback are test/update/install-e2e.sh's (release.yml's smoke job runs both).
-# Private: HOME, the install folder, the home, ports. Exit 0 when every check passes; PASS/FAIL lines on stdout.
+# Private: HOME (Windows: USERPROFILE, LOCALAPPDATA and APPDATA), the install folder, the home, ports. Exit 0 when every check passes; PASS/FAIL lines on stdout.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd); ROOT=$HERE/../..
 REL=$(cd "$1" && pwd)
@@ -25,7 +25,9 @@ fp() { py -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.ge
 T=$(mktemp -d "${RC_DIR:-${RUNNER_TEMP:-$ROOT/build}}/rc.XXXXXX"); P=$(fp); FP=$(fp); PP=$(fp)
 H=$T/home; PREFIX=$T/prefix; mkdir -p "$H" "$T/u" "$T/feed" "$T/proj"
 export HOME=$T/u BACKPLANE_AGENTS=$T/agents BACKPLANE_UPDATE_FEED=http://127.0.0.1:$FP/releases.json BACKPLANE_GUARD_STABLE=10
-[ -z "$win" ] || export USERPROFILE="$(cygpath -w "$T/u")" LOCALAPPDATA="$(cygpath -w "$T/u")"
+# APPDATA too: the client keeps its settings in %APPDATA%\backplane-gpui (plat::config_base), so without it the smoke wrote its hubs.json, naming this
+# run's hub and token file, into the real profile of whoever ran it (a self-hosted runner's or a person's), and the hub read that profile's KiCad settings
+[ -z "$win" ] || export USERPROFILE="$(cygpath -w "$T/u")" LOCALAPPDATA="$(cygpath -w "$T/u")" APPDATA="$(cygpath -w "$T/u")"
 unset BACKPLANE_BUILDS BACKPLANE_GUARD BACKPLANE_NO_UPDATE BACKPLANE_COPY BACKPLANE_HOME
 mkdir -p "$BACKPLANE_AGENTS"
 G=$PREFIX/backplane$X
